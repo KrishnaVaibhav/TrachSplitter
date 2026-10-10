@@ -1,0 +1,45 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a 4-minute MP3
+        2. Model htdemucs, Output: Vocals + everything else
+        3. Click Separate
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How do you run TrachSplitter?
+      options:
+        - Windows app (TrachSplitter.exe)
+        - macOS app
+        - From source (python main.py)
+        - CLI (cli.py)
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS and processor
+      placeholder: Windows 11, RTX 3060 (cuda)
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log output
+      description: Last lines of ~/.trachsplitter/app.log (Help › Show Log Folder).
+      render: text

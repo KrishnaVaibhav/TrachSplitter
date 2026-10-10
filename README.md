@@ -1,5 +1,8 @@
 # TrachSplitter
 
+[![CI](https://github.com/KrishnaVaibhav/TrachSplitter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/KrishnaVaibhav/TrachSplitter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > AI stem separation and mixing on your own computer, powered by Meta's [Demucs v4](https://github.com/facebookresearch/demucs).
 
 Split any song into vocals, drums, bass, guitar, piano and other. Then remix the stems, change the key or speed, hit a streaming loudness target and export. Everything runs locally; your audio never leaves your machine.
@@ -196,9 +199,15 @@ TrachSplitter/
 
 ---
 
+## Contributing
+
+Pull requests are welcome. `main` is protected: every change needs a PR, a green **CI passed**
+check (lint, tests on Linux + Windows, Windows app build) and a code-owner review.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks and PR title format.
+
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ## Acknowledgements
 
