@@ -75,6 +75,8 @@ class Config:
         'batch_processing': True,
         'preview_enabled': True,
         'auto_convert': True,
+        'auto_save_stems': False,  # write stems to <working dir>/<track>/ after separating
+        'loudness_target': -14.0,  # LUFS target for loudness normalization
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -91,15 +93,21 @@ class Config:
             try:
                 with open(self.config_path, 'r') as f:
                     loaded = json.load(f)
+                if isinstance(loaded, dict):
                     self.config.update(loaded)
             except Exception as e:
                 print(f"Failed to load config: {e}, using defaults")
 
     def save(self):
-        """Save configuration to file."""
+        """Save configuration to file (atomic: a crash can't corrupt it)."""
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-        with open(self.config_path, 'w') as f:
-            json.dump(self.config, f, indent=2)
+        tmp_path = self.config_path + '.tmp'
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            os.replace(tmp_path, self.config_path)
+        except OSError as e:
+            print(f"Failed to save config: {e}")
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
@@ -109,7 +117,12 @@ class Config:
         """Pick the best available processing device."""
         try:
             import torch
-            return 'cuda' if torch.cuda.is_available() else 'cpu'
+            if torch.cuda.is_available():
+                return 'cuda'
+            mps = getattr(torch.backends, 'mps', None)
+            if mps is not None and mps.is_available():
+                return 'mps'
+            return 'cpu'
         except Exception:
             return 'cpu'
 
@@ -124,4 +137,5 @@ class Config:
     def reset_to_defaults(self):
         """Reset configuration to defaults."""
         self.config = self.DEFAULT_CONFIG.copy()
+        self.config['device'] = self._default_device()
         self.save()

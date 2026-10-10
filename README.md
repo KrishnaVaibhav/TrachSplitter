@@ -153,7 +153,7 @@ pip install -r requirements.txt
 
 ## Project Structure
 
-```
+```/
 TrachSplitter/
 ├── gui.py                  # PySide6 desktop app
 ├── cli.py                  # Command-line interface

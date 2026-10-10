@@ -51,15 +51,15 @@ HIDDEN_IMPORTS = [
     "torch", "torch.nn", "torch.nn.functional", "torch.jit", "torch.utils",
     "torch.utils.data", "torchaudio", "torchaudio.transforms",
     # Demucs internals (dynamic imports)
-    "demucs", "demucs.api", "demucs.apply", "demucs.audio", "demucs.htdemucs",
-    "demucs.hdemucs", "demucs.model", "demucs.pretrained", "demucs.repo",
+    "demucs", "demucs.apply", "demucs.audio", "demucs.htdemucs",
+    "demucs.hdemucs", "demucs.pretrained", "demucs.repo",
     "demucs.remote", "demucs.states", "demucs.svd", "demucs.utils",
     "demucs.spec", "demucs.transformer",
     # Scientific stack
-    "numpy", "scipy", "scipy.signal", "scipy.signal._spectral_helper",
+    "numpy", "scipy", "scipy.signal",
     "scipy.io", "scipy.io.wavfile",
     "librosa", "librosa.core", "librosa.feature", "librosa.effects",
-    "soundfile", "sndfile",
+    "soundfile",
     # PySide6
     "PySide6", "PySide6.QtCore", "PySide6.QtWidgets", "PySide6.QtGui",
     "PySide6.QtMultimedia", "PySide6.QtOpenGL",
@@ -67,11 +67,13 @@ HIDDEN_IMPORTS = [
     "matplotlib", "matplotlib.figure", "matplotlib.widgets",
     "matplotlib.backends.backend_qtagg",
     "matplotlib.backends.backend_agg",
+    # Project modules (some are imported lazily inside functions)
+    "config", "demucs_separator", "audio_editor", "audio_analysis",
+    "scipy.ndimage",
     # Other runtime dependencies
     "yaml", "tqdm", "einops", "dora", "treetable",
     "julius", "antlr4",
     "omegaconf", "omegaconf._utils",
-    "hydra", "hydra._internal",
 ]
 
 EXCLUDES = [
@@ -100,7 +102,8 @@ def collect_datas() -> list[tuple[str, str]]:
     datas = []
 
     # Local project modules that PyInstaller may miss
-    for name in ["config.py", "demucs_separator.py", "audio_editor.py"]:
+    for name in ["config.py", "demucs_separator.py", "audio_editor.py",
+                 "audio_analysis.py", "icon.ico", "icon.svg"]:
         src = ROOT / name
         if src.exists():
             datas.append((str(src), "."))
@@ -198,6 +201,11 @@ def build_pyinstaller(onefile: bool):
     for src, dst in datas:
         cmd += ["--add-data", f"{src}{sep}{dst}"]
 
+    # Package data loaded at runtime (demucs model registry: remote/files.txt,
+    # *.yaml; librosa example/filter data)
+    for pkg in ("demucs", "librosa"):
+        cmd += ["--collect-data", pkg]
+
     # Hidden imports
     for hi in hidden:
         cmd += ["--hidden-import", hi]
@@ -222,6 +230,8 @@ def build_pyinstaller(onefile: bool):
             "--windowed",          # no console window
             "--version-file", _write_win_version_file(),
         ]
+        if (ROOT / "icon.ico").exists():
+            cmd += ["--icon", str(ROOT / "icon.ico")]
     # Linux: no --windowed, terminal stays available as fallback
 
     cmd.append(str(ENTRY))

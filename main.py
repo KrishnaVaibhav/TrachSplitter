@@ -57,17 +57,12 @@ def main():
         print("TrachSplitter - Audio Source Separation & Editing")
         print("Using Demucs v4 (Meta Research)\n")
 
-        # Import GUI
-        from gui import TrachSplitterGUI
-        from PySide6.QtWidgets import QApplication
+        # gui.main sets the Windows taskbar identity and app icon
+        import gui
+        gui.main()
 
-        # Create and show application
-        app = QApplication(sys.argv)
-        window = TrachSplitterGUI()
-        window.show()
-
-        sys.exit(app.exec())
-
+    except SystemExit:
+        raise
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
         print(f"Error: {e}")

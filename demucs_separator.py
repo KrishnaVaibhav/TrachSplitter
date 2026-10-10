@@ -1,12 +1,12 @@
 """Demucs v4 audio separator wrapper."""
 import os
-import sys
+import threading
+import time
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Callable
+from typing import List, Dict, Optional, Callable
 import torch
 import torchaudio
 import numpy as np
-from tqdm import tqdm
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
 from demucs.audio import AudioFile
@@ -15,6 +15,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SAMPLE_RATE = 44100
+
+
+class SeparationCancelled(Exception):
+    """Raised when a running separation is cancelled by the user."""
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds}s"
+
 
 class DemucsSeparator:
     """Wrapper around Demucs v4 for audio source separation."""
@@ -22,7 +37,7 @@ class DemucsSeparator:
     def __init__(
         self,
         model_name: str = 'htdemucs',
-        device: str = 'cuda',
+        device: Optional[str] = 'cuda',
         segment: Optional[int] = None,
         overlap: float = 0.25,
         shifts: int = 1,
@@ -32,7 +47,7 @@ class DemucsSeparator:
 
         Args:
             model_name: Model to use (htdemucs, mdx, etc.)
-            device: 'cuda' or 'cpu'
+            device: 'cuda', 'mps' or 'cpu' (None = best available)
             segment: Segment length in seconds (None for auto)
             overlap: Overlap between segments (0-1)
             shifts: Number of prediction shifts (>1 slower but better)
@@ -46,13 +61,30 @@ class DemucsSeparator:
         self.progress_callback = progress_callback
         self.model = None
         self.sources = None
+        self._cancel = threading.Event()
         self._load_model()
 
-    def _validate_device(self, device: str) -> str:
+    @staticmethod
+    def best_device() -> str:
+        if torch.cuda.is_available():
+            return 'cuda'
+        mps = getattr(torch.backends, 'mps', None)
+        if mps is not None and mps.is_available():
+            return 'mps'
+        return 'cpu'
+
+    def _validate_device(self, device: Optional[str]) -> str:
         """Validate and set device."""
+        if not device:
+            return self.best_device()
         if device == 'cuda' and not torch.cuda.is_available():
             logger.warning("CUDA not available, falling back to CPU")
             return 'cpu'
+        if device == 'mps':
+            mps = getattr(torch.backends, 'mps', None)
+            if mps is None or not mps.is_available():
+                logger.warning("MPS not available, falling back to CPU")
+                return 'cpu'
         return device
 
     def _load_model(self):
@@ -61,11 +93,70 @@ class DemucsSeparator:
             logger.info(f"Loading model: {self.model_name}")
             self.model = get_model(self.model_name)
             self.model.to(self.device)
+            self.model.eval()
             self.sources = list(getattr(self.model, "sources", []))
             logger.info(f"Model loaded. Sources: {self.sources}")
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
+
+    # ── Cancellation ────────────────────────────────────────────────────────
+
+    def cancel(self):
+        """Request cancellation of the running separation."""
+        self._cancel.set()
+
+    def _check_cancel(self):
+        if self._cancel.is_set():
+            raise SeparationCancelled("Separation cancelled")
+
+    def _report(self, msg: str, pct: int):
+        if self.progress_callback:
+            self.progress_callback(msg, pct)
+
+    # ── Loading ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def load_audio(audio_path: str) -> torch.Tensor:
+        """Load audio as a (2, samples) float tensor at 44.1 kHz.
+
+        Tries FFmpeg (via demucs) first, then soundfile/librosa so WAV,
+        FLAC, OGG and MP3 still work on machines without FFmpeg.
+        """
+        wav = None
+        sr = SAMPLE_RATE
+        try:
+            wav = AudioFile(Path(audio_path)).read(
+                streams=0, samplerate=SAMPLE_RATE, channels=2
+            )
+            if not isinstance(wav, torch.Tensor):
+                wav = torch.from_numpy(np.asarray(wav))
+        except Exception as e:
+            logger.info(f"FFmpeg load failed ({e}); falling back to soundfile")
+            try:
+                import soundfile as sf
+                data, sr = sf.read(audio_path, dtype='float32', always_2d=True)
+                wav = torch.from_numpy(np.ascontiguousarray(data.T))
+            except Exception as e2:
+                logger.info(f"soundfile load failed ({e2}); trying librosa")
+                import librosa
+                data, sr = librosa.load(audio_path, sr=None, mono=False)
+                wav = torch.from_numpy(np.atleast_2d(data).astype(np.float32))
+
+        wav = wav.float()
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        if sr != SAMPLE_RATE:
+            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+        if wav.shape[0] == 1:
+            wav = wav.repeat(2, 1)
+        elif wav.shape[0] > 2:
+            wav = wav[:2]
+        if wav.shape[-1] == 0:
+            raise ValueError("Audio file is empty")
+        return wav
+
+    # ── Separation ──────────────────────────────────────────────────────────
 
     def separate(
         self,
@@ -80,61 +171,59 @@ class DemucsSeparator:
             audio_path: Path to audio file
             output_dir: Directory to save separated stems
             stem_sources: List of stems to extract
-            two_stems: Extract only one stem (e.g., 'vocals')
+            two_stems: Return only this stem plus 'no_<stem>' (everything else)
 
         Returns:
-            Dictionary mapping stem names to audio arrays
+            Dictionary mapping stem names to (channels, samples) float32 arrays
         """
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        try:
-            logger.info(f"Separating: {audio_path}")
-            if self.progress_callback:
-                self.progress_callback("Loading audio...", 0)
+        self._cancel.clear()
+        logger.info(f"Separating: {audio_path}")
+        self._report("Loading audio...", 0)
+        wav = self.load_audio(audio_path)
+        self._check_cancel()
 
-            # Load audio
-            audio = AudioFile(Path(audio_path))
-            audio_data = audio.read(streams=0, channels=2, samplerate=44100)
-            if isinstance(audio_data, torch.Tensor):
-                audio_tensor = audio_data
-            else:
-                audio_tensor = torch.from_numpy(audio_data)
+        # Same input normalization the demucs CLI uses — the models were
+        # trained on standardized audio, skipping it costs quality
+        ref = wav.mean(0)
+        mean = ref.mean()
+        std = ref.std()
+        if not torch.isfinite(std) or std < 1e-8:
+            std = torch.tensor(1.0)
+        wav = (wav - mean) / std
 
-            if audio_tensor.ndim == 1:
-                audio_tensor = audio_tensor.unsqueeze(0).repeat(2, 1)
+        self._report("Separating stems...", 5)
+        stems = self._apply_with_progress(wav.unsqueeze(0))
+        stems = stems * std + mean
 
-            if self.progress_callback:
-                self.progress_callback("Separating stems...", 10)
+        all_stems = {
+            source: stems[0, i].numpy().astype(np.float32, copy=False)
+            for i, source in enumerate(self.sources)
+        }
+        del stems
 
-            # Perform separation with real per-chunk progress
-            mix = audio_tensor.unsqueeze(0)
-            stems = self._apply_with_progress(mix)
+        if two_stems and two_stems in all_stems:
+            others = [d for n, d in all_stems.items() if n != two_stems]
+            complement = np.sum(others, axis=0).astype(np.float32) if others else \
+                np.zeros_like(all_stems[two_stems])
+            peak = float(np.abs(complement).max()) if complement.size else 0.0
+            if peak > 1.0:
+                complement /= peak
+            result = {two_stems: all_stems[two_stems], f'no_{two_stems}': complement}
+        else:
+            result = {
+                n: d for n, d in all_stems.items()
+                if not stem_sources or n in stem_sources
+            }
 
-            # Process stems
-            result = {}
-            for i, source in enumerate(self.sources):
-                if stem_sources and source not in stem_sources:
-                    continue
+        self._report("Separation complete", 100)
 
-                stem_data = stems[0, i].cpu().numpy()
-                if stem_data.ndim == 3:
-                    stem_data = stem_data[0]  # Remove batch dimension
+        if output_dir:
+            self._save_stems(result, output_dir)
 
-                result[source] = stem_data
-
-            if self.progress_callback:
-                self.progress_callback("Separation complete", 100)
-
-            # Save stems if output_dir specified
-            if output_dir:
-                self._save_stems(result, output_dir, two_stems)
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Separation failed: {e}")
-            raise
+        return result
 
     def _segment_seconds(self) -> float:
         """Segment length in seconds, never exceeding the model's own limit.
@@ -165,32 +254,31 @@ class DemucsSeparator:
         Returns:
             (1, sources, channels, samples) tensor on CPU
         """
-        sample_rate = 44100
-        seg_len = int(self._segment_seconds() * sample_rate)
+        seg_len = int(self._segment_seconds() * SAMPLE_RATE)
         if self.shifts:
             # apply_model's shift trick pads each chunk by up to 0.5 s;
             # leave that headroom or htdemucs rejects the padded length
-            seg_len -= int(0.5 * sample_rate)
-        seg_len = max(seg_len, sample_rate)
+            seg_len -= int(0.5 * SAMPLE_RATE)
+        seg_len = max(seg_len, SAMPLE_RATE)
         length = mix.shape[-1]
 
         def run_chunk(chunk: torch.Tensor) -> torch.Tensor:
-            return apply_model(
-                self.model,
-                chunk.to(self.device),
-                shifts=self.shifts,
-                split=False,
-                overlap=self.overlap,
-                progress=False,
-                device=self.device,
-            ).cpu()
+            with torch.inference_mode():
+                return apply_model(
+                    self.model,
+                    chunk.to(self.device),
+                    shifts=self.shifts,
+                    split=False,
+                    overlap=self.overlap,
+                    progress=False,
+                    device=self.device,
+                ).cpu()
 
         if length <= seg_len:
-            if self.progress_callback:
-                self.progress_callback("Separating stems...", 30)
+            self._report("Separating stems...", 30)
             out = run_chunk(mix)
-            if self.progress_callback:
-                self.progress_callback("Finalizing...", 95)
+            self._check_cancel()
+            self._report("Finalizing...", 95)
             return out
 
         stride = max(1, int((1 - self.overlap) * seg_len))
@@ -204,7 +292,9 @@ class DemucsSeparator:
 
         out = None
         sum_weight = torch.zeros(length)
+        started = time.monotonic()
         for i, offset in enumerate(offsets):
+            self._check_cancel()
             chunk = mix[..., offset: offset + seg_len]
             chunk_out = run_chunk(chunk)
             if out is None:
@@ -213,11 +303,16 @@ class DemucsSeparator:
             w = weight[:chunk_len]
             out[..., offset: offset + chunk_len] += w * chunk_out
             sum_weight[offset: offset + chunk_len] += w
-            if self.progress_callback:
-                pct = 10 + int(85 * (i + 1) / len(offsets))
-                self.progress_callback(
-                    f"Separating... chunk {i + 1}/{len(offsets)}", pct
-                )
+            done = i + 1
+            elapsed = time.monotonic() - started
+            eta = elapsed / done * (len(offsets) - done)
+            pct = 5 + int(90 * done / len(offsets))
+            self._report(
+                f"Separating... chunk {done}/{len(offsets)} · ~{_format_eta(eta)} left",
+                pct
+            )
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
         return out / sum_weight.clamp(min=1e-8)
 
     def _save_stems(
@@ -226,44 +321,27 @@ class DemucsSeparator:
         output_dir: str,
         two_stems: Optional[str] = None
     ):
-        """Save separated stems to disk."""
+        """Save separated stems to disk as WAV.
+
+        ``two_stems`` is accepted for backward compatibility; ``separate``
+        already returns the stem + complement pair when it is requested.
+        """
         os.makedirs(output_dir, exist_ok=True)
-
-        if two_stems:
-            # Save requested stem plus the complement mix of all others
-            # (e.g. vocals.wav + no_vocals.wav for karaoke)
-            stem_data = stems[two_stems]
-            torchaudio.save(
-                os.path.join(output_dir, f'{two_stems}.wav'),
-                torch.from_numpy(stem_data).float(),
-                44100
-            )
-            others = [data for name, data in stems.items() if name != two_stems]
+        if two_stems and f'no_{two_stems}' not in stems and two_stems in stems:
+            others = [d for n, d in stems.items() if n != two_stems]
+            pair = {two_stems: stems[two_stems]}
             if others:
-                max_len = max(data.shape[-1] for data in others)
-                complement = np.zeros((others[0].shape[0], max_len), dtype=np.float32)
-                for data in others:
-                    complement[:, :data.shape[-1]] += data
-                peak = np.abs(complement).max()
-                if peak > 1.0:
-                    complement /= peak
-                torchaudio.save(
-                    os.path.join(output_dir, f'no_{two_stems}.wav'),
-                    torch.from_numpy(complement).float(),
-                    44100
-                )
-        else:
-            # Save all stems
-            for stem_name, stem_data in stems.items():
-                tensor = torch.from_numpy(stem_data).float()
-                if tensor.ndim == 2 and tensor.shape[0] not in (1, 2):
-                    tensor = tensor.T
-                torchaudio.save(
-                    os.path.join(output_dir, f'{stem_name}.wav'),
-                    tensor,
-                    44100
-                )
-
+                pair[f'no_{two_stems}'] = np.sum(others, axis=0)
+            stems = pair
+        for stem_name, stem_data in stems.items():
+            tensor = torch.from_numpy(np.ascontiguousarray(stem_data)).float()
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            torchaudio.save(
+                os.path.join(output_dir, f'{stem_name}.wav'),
+                tensor.clamp(-1.0, 1.0),
+                SAMPLE_RATE
+            )
         logger.info(f"Stems saved to {output_dir}")
 
     def get_sources(self) -> List[str]:

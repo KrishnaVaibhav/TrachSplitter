@@ -1,5 +1,5 @@
 """Setup configuration for TrachSplitter."""
-from setuptools import setup, find_packages
+from setuptools import setup
 from pathlib import Path
 
 # Read README
@@ -38,19 +38,23 @@ setup(
         "librosa>=0.10.0",
         "soundfile>=0.12.0",
         "pydub>=0.25.1",
-        "PyQt6>=6.5.0",
+        "PySide6>=6.5.0",
         "matplotlib>=3.5.0",
-        "pillow>=9.0.0",
-        "pyyaml>=6.0",
         "tqdm>=4.64.0",
     ],
     entry_points={
         "console_scripts": [
-            "trachsplitter=main:main",
             "trachsplitter-cli=cli:main",
         ],
+        "gui_scripts": [
+            "trachsplitter=main:main",
+        ],
     },
-    packages=find_packages(),
+    # Flat layout: the app is a set of top-level modules, not a package
+    py_modules=[
+        "main", "gui", "cli", "config", "demucs_separator",
+        "audio_editor", "audio_analysis",
+    ],
     include_package_data=True,
     keywords=[
         "audio",

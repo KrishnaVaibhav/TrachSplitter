@@ -16,6 +16,76 @@ _PITCH_CLASSES = ['C', 'C#', 'D', 'D#', 'E', 'F',
                   'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 
+def _k_weighting_sos(sample_rate: int) -> np.ndarray:
+    """ITU-R BS.1770 K-weighting (high shelf + RLB high-pass) for any rate."""
+    # Stage 1: high shelf, +4 dB above ~1.68 kHz
+    G, Q, fc = 4.0, 1 / np.sqrt(2), 1681.974450955533
+    A = 10 ** (G / 40.0)
+    w0 = 2 * np.pi * fc / sample_rate
+    alpha = np.sin(w0) / (2 * Q)
+    c = np.cos(w0)
+    sa = 2 * np.sqrt(A) * alpha
+    b = [A * ((A + 1) + (A - 1) * c + sa),
+         -2 * A * ((A - 1) + (A + 1) * c),
+         A * ((A + 1) + (A - 1) * c - sa)]
+    a = [(A + 1) - (A - 1) * c + sa,
+         2 * ((A - 1) - (A + 1) * c),
+         (A + 1) - (A - 1) * c - sa]
+    shelf = [b[0] / a[0], b[1] / a[0], b[2] / a[0], 1.0, a[1] / a[0], a[2] / a[0]]
+    # Stage 2: high-pass at ~38 Hz
+    Q, fc = 0.5003270373238773, 38.13547087602444
+    w0 = 2 * np.pi * fc / sample_rate
+    alpha = np.sin(w0) / (2 * Q)
+    c = np.cos(w0)
+    b = [(1 + c) / 2, -(1 + c), (1 + c) / 2]
+    a = [1 + alpha, -2 * c, 1 - alpha]
+    hp = [b[0] / a[0], b[1] / a[0], b[2] / a[0], 1.0, a[1] / a[0], a[2] / a[0]]
+    return np.array([shelf, hp])
+
+
+def integrated_loudness(audio: np.ndarray, sample_rate: int = 44100) -> float:
+    """Integrated loudness in LUFS (ITU-R BS.1770-4, gated).
+
+    Args:
+        audio: (channels, samples) or (samples,) array
+
+    Returns:
+        Loudness in LUFS, or -inf for silence / audio shorter than 400 ms
+    """
+    from scipy import signal
+    audio = np.asarray(audio, dtype=np.float64)
+    if audio.ndim == 1:
+        audio = audio.reshape(1, -1)
+    elif audio.shape[0] > audio.shape[1]:
+        audio = audio.T
+    audio = audio[:2]
+    block = int(0.4 * sample_rate)
+    hop = block // 4  # 75 % overlap
+    n = audio.shape[1]
+    if n < block:
+        return float('-inf')
+
+    weighted = signal.sosfilt(_k_weighting_sos(sample_rate), audio, axis=-1)
+    # Per-block mean square via cumulative sums (vectorized)
+    csum = np.concatenate(
+        [np.zeros((weighted.shape[0], 1)), np.cumsum(weighted ** 2, axis=1)], axis=1
+    )
+    starts = np.arange(0, n - block + 1, hop)
+    z = (csum[:, starts + block] - csum[:, starts]) / block  # (ch, blocks)
+    power = z.sum(axis=0)
+    with np.errstate(divide='ignore'):
+        lk = -0.691 + 10 * np.log10(power + 1e-20)
+
+    gated = lk > -70.0
+    if not gated.any():
+        return float('-inf')
+    rel_threshold = -0.691 + 10 * np.log10(power[gated].mean()) - 10.0
+    gated &= lk > rel_threshold
+    if not gated.any():
+        return float('-inf')
+    return float(-0.691 + 10 * np.log10(power[gated].mean()))
+
+
 class AudioAnalyzer:
     """Tempo, key, and loudness analysis for audio files and arrays."""
 
@@ -103,13 +173,17 @@ class AudioAnalyzer:
             duration_sec, rms_db, peak_db, sample_rate
         """
         import librosa
-        mono, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
+        audio, sr = librosa.load(audio_path, sr=self.sample_rate, mono=False)
+        audio = np.atleast_2d(audio)
+        mono = audio.mean(axis=0)
 
         bpm, beat_times = self.detect_tempo(mono)
         key, mode, confidence = self.detect_key(mono)
         loudness = self.measure_loudness(mono)
+        lufs = integrated_loudness(audio, sr)
 
         return {
+            'lufs': round(lufs, 1) if np.isfinite(lufs) else None,
             'bpm': round(bpm, 1),
             'beat_times': beat_times,
             'key': key,

@@ -20,15 +20,48 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QGridLayout, QApplication
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QUrl
-from PySide6.QtGui import QIcon, QFont
+from PySide6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 import subprocess
 import time
 
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a'}
+AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.aiff', '.aif'}
+AUDIO_FILTER = "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac *.aiff *.aif);;All Files (*)"
+EXPORT_FILTERS = {
+    'wav': "WAV Files (*.wav)",
+    'mp3': "MP3 Files (*.mp3)",
+    'flac': "FLAC Files (*.flac)",
+    'ogg': "OGG Files (*.ogg)",
+}
+ALL_STEMS = ['drums', 'bass', 'vocals', 'other', 'guitar', 'piano']
+
+# Mix presets: ('keep', names) plays only those stems, ('mute', names)
+# plays everything except them. Works for 4/6-stem and karaoke results.
+MIX_PRESETS = {
+    "Full Mix":        ('mute', set()),
+    "Instrumental":    ('mute', {'vocals'}),
+    "Vocals Only":     ('keep', {'vocals'}),
+    "Drums + Bass":    ('keep', {'drums', 'bass'}),
+    "Drumless":        ('mute', {'drums'}),
+    "Bassless":        ('mute', {'bass'}),
+    "Ambient / Other": ('keep', {'other'}),
+}
+
+
+def preset_active_stems(preset: str, stem_names) -> set:
+    """Stems that sound under a preset, given the stems we actually have."""
+    mode, names = MIX_PRESETS.get(preset, ('mute', set()))
+    stem_names = set(stem_names)
+    if mode == 'keep':
+        return stem_names & names
+    return stem_names - names
+
+
+def _safe_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in " ._-()" else "_" for c in name).strip() or "track"
 
 from config import Config
-from demucs_separator import DemucsSeparator
+from demucs_separator import DemucsSeparator, SeparationCancelled
 from audio_editor import AudioEditor
 import soundfile as sf
 import logging
@@ -43,12 +76,16 @@ class SeparationWorker(QThread):
     progress_update = Signal(str, int)
     finished = Signal(dict)
     error = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, separator: DemucsSeparator, audio_path: str, config: Dict):
         super().__init__()
         self.separator = separator
         self.audio_path = audio_path
         self.config = config
+
+    def cancel(self):
+        self.separator.cancel()
 
     def run(self):
         self.separator.progress_callback = (
@@ -61,11 +98,74 @@ class SeparationWorker(QThread):
                 two_stems=self.config.get('two_stems')
             )
             self.finished.emit(result)
+        except SeparationCancelled:
+            self.cancelled.emit()
         except Exception as e:
             self.error.emit(str(e))
             logger.error(f"Separation error: {e}\n{traceback.format_exc()}")
         finally:
             self.separator.progress_callback = None
+
+
+class BatchWorker(QThread):
+    """Separate a queue of files, writing each track's stems to its own folder."""
+
+    progress_update = Signal(str, int)
+    file_done = Signal(str, bool, str)  # path, ok, message
+    all_done = Signal(int, int, bool)   # ok count, failed count, cancelled
+
+    def __init__(self, separator: DemucsSeparator, files: list, out_root: str,
+                 fmt: str, bitrate: str, two_stems: Optional[str],
+                 stem_sources: Optional[list]):
+        super().__init__()
+        self.separator = separator
+        self.files = files
+        self.out_root = out_root
+        self.fmt = fmt
+        self.bitrate = bitrate
+        self.two_stems = two_stems
+        self.stem_sources = stem_sources
+        self._stop = False
+
+    def cancel(self):
+        self._stop = True
+        self.separator.cancel()
+
+    def run(self):
+        editor = AudioEditor()
+        ok = failed = 0
+        total = len(self.files)
+        for i, path in enumerate(self.files):
+            if self._stop:
+                break
+            name = Path(path).name
+
+            def cb(msg, pct, i=i, name=name):
+                overall = int((i + pct / 100.0) / total * 100)
+                self.progress_update.emit(f"[{i + 1}/{total}] {name}: {msg}", overall)
+
+            self.separator.progress_callback = cb
+            try:
+                stems = self.separator.separate(
+                    path, stem_sources=self.stem_sources, two_stems=self.two_stems
+                )
+                out_dir = os.path.join(self.out_root, _safe_filename(Path(path).stem))
+                os.makedirs(out_dir, exist_ok=True)
+                for stem_name, audio in stems.items():
+                    editor.export_audio(
+                        audio, os.path.join(out_dir, f"{stem_name}.{self.fmt}"),
+                        self.fmt, self.bitrate
+                    )
+                ok += 1
+                self.file_done.emit(path, True, out_dir)
+            except SeparationCancelled:
+                break
+            except Exception as e:
+                failed += 1
+                logger.error(f"Batch error on {path}: {e}\n{traceback.format_exc()}")
+                self.file_done.emit(path, False, str(e))
+        self.separator.progress_callback = None
+        self.all_done.emit(ok, failed, self._stop)
 
 
 class TaskWorker(QThread):
@@ -334,7 +434,7 @@ class ModelLoadWorker(QThread):
     finished = Signal(object)
     error = Signal(str)
 
-    def __init__(self, model_name: str, device: str):
+    def __init__(self, model_name: str, device: Optional[str]):
         super().__init__()
         self.model_name = model_name
         self.device = device
@@ -369,7 +469,6 @@ class TrachSplitterGUI(QMainWindow):
         self.preview_temp_dir = None
         self.preview_files: Dict[str, str] = {}
         self.current_preview_stem: Optional[str] = None
-        self._model_worker: Optional[ModelLoadWorker] = None
         self._mix_temp_dir: Optional[str] = None
         self.stem_mutes: Dict[str, object] = {}
         self.stem_solos: Dict[str, object] = {}
@@ -380,6 +479,13 @@ class TrachSplitterGUI(QMainWindow):
 
         self._task_workers: list = []
         self._render_buttons: list = []
+        self._model_workers: list = []  # keep refs: a GC'd running QThread crashes
+        self.worker: Optional[SeparationWorker] = None
+        self._batch_worker: Optional[BatchWorker] = None
+        self._analysis_result: Optional[dict] = None
+        self.mixer_rows: Dict[str, QWidget] = {}
+        self.stem_sliders: Dict[str, QSlider] = {}
+        self.stem_labels: Dict[str, QLabel] = {}
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -390,7 +496,38 @@ class TrachSplitterGUI(QMainWindow):
         self.setAcceptDrops(True)
 
         self.init_ui()
+        self._init_shortcuts()
         self.load_model()
+
+    def _init_shortcuts(self):
+        """Keyboard shortcuts for the most frequent actions."""
+        bindings = [
+            ("Ctrl+O", self.browse_audio_file),
+            ("Ctrl+Return", self.start_separation),
+            ("Ctrl+S", self.save_stems),
+            ("Ctrl+E", self.export_mix),
+            ("Ctrl+B", self.start_batch),
+            ("Space", self.toggle_playback),
+            ("Escape", self.cancel_separation),
+        ]
+        for keys, slot in bindings:
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.activated.connect(slot)
+
+    def toggle_playback(self):
+        """Space: stop if playing, else play the current context."""
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.stop_playback()
+        elif self.tabs.currentIndex() == 1:
+            self.preview_mix()
+        else:
+            self.play_selected_stem()
+
+    def _is_busy(self) -> bool:
+        return bool(
+            (self.worker and self.worker.isRunning())
+            or (self._batch_worker and self._batch_worker.isRunning())
+        )
 
     # ── Background tasks ────────────────────────────────────────────────────
 
@@ -420,19 +557,34 @@ class TrachSplitterGUI(QMainWindow):
 
     # ── Drag & drop ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _audio_paths_from_urls(urls) -> list:
+        """Audio files from dropped URLs; dropped folders are scanned."""
+        paths = []
+        for url in urls:
+            p = Path(url.toLocalFile())
+            if p.is_dir():
+                paths += sorted(
+                    str(f) for f in p.iterdir()
+                    if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+                )
+            elif p.suffix.lower() in AUDIO_EXTENSIONS:
+                paths.append(str(p))
+        return paths
+
     def dragEnterEvent(self, event):
-        for url in event.mimeData().urls():
-            if Path(url.toLocalFile()).suffix.lower() in AUDIO_EXTENSIONS:
-                event.acceptProposedAction()
-                return
+        if self._audio_paths_from_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
 
     def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if Path(path).suffix.lower() in AUDIO_EXTENSIONS:
-                self.load_audio_file(path)
-                event.acceptProposedAction()
-                return
+        paths = self._audio_paths_from_urls(event.mimeData().urls())
+        if not paths:
+            return
+        event.acceptProposedAction()
+        if len(paths) == 1:
+            self.load_audio_file(paths[0])
+        else:
+            self.start_batch(paths)
 
     def init_ui(self):
         """Initialize user interface."""
@@ -480,6 +632,7 @@ class TrachSplitterGUI(QMainWindow):
 
         # Create tab widget
         tabs = QTabWidget()
+        self.tabs = tabs
 
         # Tab 1: Separation
         separation_widget = self.create_separation_tab()
@@ -733,10 +886,19 @@ class TrachSplitterGUI(QMainWindow):
         self.analysis_label.setObjectName("hint")
         self.analysis_label.setWordWrap(True)
         analysis_layout.addWidget(self.analysis_label)
+        analysis_btns = QHBoxLayout()
+        analysis_btns.setSpacing(8)
         self.analyze_btn = QPushButton("Analyze Track")
         self.analyze_btn.setObjectName("secondary_btn")
         self.analyze_btn.clicked.connect(self.analyze_track)
-        analysis_layout.addWidget(self.analyze_btn)
+        analysis_btns.addWidget(self.analyze_btn)
+        self.click_btn = QPushButton("Export Click Track…")
+        self.click_btn.setObjectName("secondary_btn")
+        self.click_btn.setToolTip("Metronome WAV aligned to the detected beats — great for practice")
+        self.click_btn.setEnabled(False)
+        self.click_btn.clicked.connect(self.export_click_track)
+        analysis_btns.addWidget(self.click_btn)
+        analysis_layout.addLayout(analysis_btns)
         layout.addWidget(analysis_group)
 
         # Model selection
@@ -842,17 +1004,47 @@ class TrachSplitterGUI(QMainWindow):
 
         # Primary action + progress: end of the input workflow, most
         # prominent element in the column (visual hierarchy)
+        self.auto_save_check = QCheckBox("Auto-save stems to working folder")
+        self.auto_save_check.setToolTip(
+            "After each separation, write every stem to\n"
+            "<working directory>/<track name>/ in the chosen output format."
+        )
+        self.auto_save_check.setChecked(bool(self.config.get('auto_save_stems', False)))
+        self.auto_save_check.toggled.connect(lambda v: self._save_setting('auto_save_stems', v))
+        layout.addWidget(self.auto_save_check)
+
+        sep_row = QHBoxLayout()
+        sep_row.setSpacing(8)
         self.separate_btn = QPushButton("Separate Audio")
         self.separate_btn.setObjectName("primary_btn")
+        self.separate_btn.setToolTip("Ctrl+Enter")
         self.separate_btn.clicked.connect(self.start_separation)
         self.separate_btn.setMinimumHeight(46)
-        layout.addWidget(self.separate_btn)
+        sep_row.addWidget(self.separate_btn, 3)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("secondary_btn")
+        self.cancel_btn.setToolTip("Stop the running separation (Esc)")
+        self.cancel_btn.setMinimumHeight(46)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_separation)
+        sep_row.addWidget(self.cancel_btn, 1)
+        layout.addLayout(sep_row)
+
+        self.batch_btn = QPushButton("Batch Separate Files…")
+        self.batch_btn.setObjectName("secondary_btn")
+        self.batch_btn.setToolTip(
+            "Pick many files (or drop several / a folder on the window).\n"
+            "Each track's stems are saved to <working directory>/<track name>/. (Ctrl+B)"
+        )
+        self.batch_btn.clicked.connect(lambda: self.start_batch())
+        layout.addWidget(self.batch_btn)
 
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
         progress_layout.setSpacing(8)
         self.progress_label = QLabel("Ready")
         self.progress_label.setObjectName("hint")
+        self.progress_label.setWordWrap(True)
         progress_layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
         progress_layout.addWidget(self.progress_bar)
@@ -927,12 +1119,13 @@ class TrachSplitterGUI(QMainWindow):
         export_row.setSpacing(8)
         export_row.addWidget(QLabel("Quick Export:"))
         self.quick_preset_combo = QComboBox()
-        self.quick_preset_combo.addItems(["Full Mix", "Instrumental", "Vocals Only", "Drums + Bass"])
+        self.quick_preset_combo.addItems(list(MIX_PRESETS.keys()))
         self.quick_preset_combo.setToolTip(
             "Full Mix = all stems\n"
-            "Instrumental = no vocals\n"
-            "Vocals Only = voice track\n"
-            "Drums + Bass = rhythm section"
+            "Instrumental = no vocals (karaoke / backing track)\n"
+            "Vocals Only = acapella\n"
+            "Drums + Bass = rhythm section\n"
+            "Drumless / Bassless = play-along tracks"
         )
         export_row.addWidget(self.quick_preset_combo, 1)
         quick_export_btn = QPushButton("Export Mix")
@@ -1001,62 +1194,14 @@ class TrachSplitterGUI(QMainWindow):
                 header.addWidget(lbl)
         mixer_layout.addLayout(header)
 
-        self.stem_sliders = {}
-        self.stem_labels = {}
-        self.stem_mutes = {}
-        self.stem_solos = {}
-
-        for stem in ['drums', 'bass', 'vocals', 'other', 'guitar', 'piano']:
-            row = QHBoxLayout()
-
-            name_lbl = QLabel(f"{stem.capitalize()}")
-            name_lbl.setMinimumWidth(60)
-            row.addWidget(name_lbl, 2)
-
-            mute_btn = QPushButton("M")
-            mute_btn.setObjectName("mute_btn")
-            mute_btn.setCheckable(True)
-            mute_btn.setFixedSize(28, 28)
-            mute_btn.setToolTip("Mute")
-            self.stem_mutes[stem] = mute_btn
-            row.addWidget(mute_btn)
-
-            solo_btn = QPushButton("S")
-            solo_btn.setObjectName("solo_btn")
-            solo_btn.setCheckable(True)
-            solo_btn.setFixedSize(28, 28)
-            solo_btn.setToolTip("Solo — silence all other stems")
-            self.stem_solos[stem] = solo_btn
-            solo_btn.clicked.connect(lambda checked, s=stem: self._handle_solo(s, checked))
-            row.addWidget(solo_btn)
-
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setMinimum(-60)
-            slider.setMaximum(12)
-            slider.setValue(0)
-            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-            slider.setTickInterval(6)
-            self.stem_sliders[stem] = slider
-            row.addWidget(slider, 5)
-
-            db_lbl = QLabel("  0 dB")
-            db_lbl.setMinimumWidth(52)
-            self.stem_labels[stem] = db_lbl
-            slider.valueChanged.connect(
-                lambda val, s=stem, lbl=db_lbl: self.update_slider_label(s, val, lbl)
-            )
-            row.addWidget(db_lbl, 1)
-
-            pan_slider = QSlider(Qt.Orientation.Horizontal)
-            pan_slider.setMinimum(-100)
-            pan_slider.setMaximum(100)
-            pan_slider.setValue(0)
-            pan_slider.setToolTip("Pan: left ↔ right (presets reset to center)")
-            pan_slider.setMaximumWidth(120)
-            self.stem_pans[stem] = pan_slider
-            row.addWidget(pan_slider, 2)
-
-            mixer_layout.addLayout(row)
+        # Rows are built from the actual separation result (4, 6 or
+        # karaoke stems) — see rebuild_mixer
+        self.mixer_rows_layout = QVBoxLayout()
+        self.mixer_rows_layout.setSpacing(2)
+        mixer_layout.addLayout(self.mixer_rows_layout)
+        self.mixer_empty_label = QLabel("Separate a track to mix its stems here.")
+        self.mixer_empty_label.setObjectName("hint")
+        mixer_layout.addWidget(self.mixer_empty_label)
 
         layout.addWidget(mixer_group)
 
@@ -1065,17 +1210,10 @@ class TrachSplitterGUI(QMainWindow):
         presets_layout = QGridLayout(presets_group)
         presets_layout.setHorizontalSpacing(8)
         presets_layout.setVerticalSpacing(8)
-        preset_defs = [
-            ("Full Mix",      {}),
-            ("Instrumental",  {"vocals"}),
-            ("Vocals Only",   {"drums", "bass", "other", "guitar", "piano"}),
-            ("Drums + Bass",  {"vocals", "other", "guitar", "piano"}),
-            ("Ambient / Other", {"drums", "bass", "vocals", "guitar", "piano"}),
-        ]
-        for i, (name, mute_set) in enumerate(preset_defs):
+        for i, name in enumerate(MIX_PRESETS):
             btn = QPushButton(name)
             btn.setObjectName("preset_btn")
-            btn.clicked.connect(lambda checked, ms=mute_set: self.apply_preset(ms))
+            btn.clicked.connect(lambda checked, n=name: self.apply_preset(n))
             presets_layout.addWidget(btn, i // 3, i % 3)
         layout.addWidget(presets_group)
         layout.addStretch()
@@ -1151,18 +1289,53 @@ class TrachSplitterGUI(QMainWindow):
         effects_layout.addLayout(fade_h)
 
         norm_h = QHBoxLayout()
-        self.normalize_check = QCheckBox("Normalize to")
-        norm_h.addWidget(self.normalize_check)
+        norm_h.addWidget(QLabel("Normalize:"))
+        self.normalize_mode = QComboBox()
+        self.normalize_mode.addItems(["Off", "Peak", "Loudness (LUFS)"])
+        self.normalize_mode.setToolTip(
+            "Peak = loudest sample hits the target (dBFS)\n"
+            "Loudness = match perceived loudness (LUFS) with a peak limiter.\n"
+            "-14 LUFS: Spotify/YouTube · -16: Apple Music · -23: broadcast"
+        )
+        norm_h.addWidget(self.normalize_mode)
         self.normalize_target = QDoubleSpinBox()
-        self.normalize_target.setMinimum(-24.0)
-        self.normalize_target.setMaximum(0.0)
-        self.normalize_target.setValue(-3.0)
+        self.normalize_target.setRange(-30.0, 0.0)
+        self.normalize_target.setSingleStep(0.5)
+        self.normalize_target.setValue(-1.0)
         self.normalize_target.setSuffix(" dB")
+        self.normalize_target.setEnabled(False)
         norm_h.addWidget(self.normalize_target)
+        self.normalize_mode.currentIndexChanged.connect(self._on_normalize_mode)
         norm_h.addStretch()
         effects_layout.addLayout(norm_h)
 
         layout.addWidget(effects_group)
+
+        # ── Practice tools: key / speed ─────────────────────────────────────
+        practice_group = QGroupBox("Pitch && Tempo")
+        practice_layout = QHBoxLayout(practice_group)
+        practice_layout.addWidget(QLabel("Key:"))
+        self.pitch_spin = QDoubleSpinBox()
+        self.pitch_spin.setRange(-12.0, 12.0)
+        self.pitch_spin.setSingleStep(1.0)
+        self.pitch_spin.setDecimals(1)
+        self.pitch_spin.setSuffix(" st")
+        self.pitch_spin.setToolTip("Transpose in semitones without changing speed")
+        practice_layout.addWidget(self.pitch_spin)
+        practice_layout.addWidget(QLabel("Speed:"))
+        self.tempo_spin = QSpinBox()
+        self.tempo_spin.setRange(25, 200)
+        self.tempo_spin.setSingleStep(5)
+        self.tempo_spin.setValue(100)
+        self.tempo_spin.setSuffix(" %")
+        self.tempo_spin.setToolTip("Slow down / speed up without changing pitch")
+        practice_layout.addWidget(self.tempo_spin)
+        reset_pt = QPushButton("Reset")
+        reset_pt.setObjectName("secondary_btn")
+        reset_pt.clicked.connect(lambda: (self.pitch_spin.setValue(0), self.tempo_spin.setValue(100)))
+        practice_layout.addWidget(reset_pt)
+        practice_layout.addStretch()
+        layout.addWidget(practice_group)
 
         # ── 5-Band EQ ────────────────────────────────────────────────────────
         eq_group = QGroupBox("5-Band EQ")
@@ -1245,14 +1418,14 @@ class TrachSplitterGUI(QMainWindow):
         device_h = QHBoxLayout()
         device_h.addWidget(QLabel("Processing Device:"))
         self.device_combo = QComboBox()
-        self.device_combo.addItems(['cuda', 'cpu'])
-        self.device_combo.setCurrentText(self.config.get('device', 'cpu'))
-        self.device_combo.currentTextChanged.connect(
-            lambda v: self._save_setting('device', v)
-        )
+        self.device_combo.addItems(['cuda', 'mps', 'cpu'])
+        self.device_combo.setCurrentText(self.config.get('device') or 'cpu')
+        self.device_combo.currentTextChanged.connect(self.on_device_changed)
         device_h.addWidget(self.device_combo)
         device_layout.addLayout(device_h)
-        device_note = QLabel("Device change applies the next time a model is loaded.")
+        device_note = QLabel("cuda = NVIDIA GPU · mps = Apple Silicon · cpu = works everywhere (slow). "
+                             "Changing it reloads the model.")
+        device_note.setWordWrap(True)
         device_note.setStyleSheet("color: #b8d8d8; font-size: 12px;")
         device_layout.addWidget(device_note)
         layout.addWidget(device_group)
@@ -1264,7 +1437,7 @@ class TrachSplitterGUI(QMainWindow):
         format_h = QHBoxLayout()
         format_h.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(['wav', 'mp3', 'flac'])
+        self.format_combo.addItems(['wav', 'mp3', 'flac', 'ogg'])
         self.format_combo.setCurrentText(self.config.get('output_format', 'wav'))
         self.format_combo.currentTextChanged.connect(
             lambda v: self._save_setting('output_format', v)
@@ -1348,14 +1521,104 @@ class TrachSplitterGUI(QMainWindow):
 
     def browse_audio_file(self):
         """Browse for audio file."""
+        start_dir = os.path.dirname(self.recent_files[0]) if self.recent_files else str(Path.home() / "Music")
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Audio File",
-            str(Path.home() / "Music"),
-            "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a);;All Files (*)"
+            start_dir,
+            AUDIO_FILTER
         )
         if file_path:
             self.load_audio_file(file_path)
+
+    # ── Batch processing ────────────────────────────────────────────────────
+
+    def start_batch(self, files: Optional[list] = None):
+        """Separate many files in a row, saving stems per track."""
+        if self._is_busy():
+            QMessageBox.information(self, "Busy", "A separation is already running.")
+            return
+        if self.separator is None:
+            QMessageBox.warning(self, "Please wait", "The model is still loading.")
+            return
+        if not files:
+            start_dir = os.path.dirname(self.recent_files[0]) if self.recent_files else str(Path.home() / "Music")
+            files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", start_dir, AUDIO_FILTER)
+        if not files:
+            return
+        out_root = QFileDialog.getExistingDirectory(
+            self, f"Save stems for {len(files)} tracks to…", self.working_directory
+        )
+        if not out_root:
+            return
+        two_stems, stem_sources = self._separation_choice()
+        self._apply_separation_params()
+        fmt = self._output_format()
+        self._batch_worker = BatchWorker(
+            self.separator, list(files), out_root, fmt,
+            f"{self.bitrate_spin.value()}k", two_stems, stem_sources
+        )
+        self._batch_worker.progress_update.connect(self.update_progress)
+        self._batch_worker.file_done.connect(self._on_batch_file_done)
+        self._batch_worker.all_done.connect(self._on_batch_done)
+        self._batch_out_root = out_root
+        self._set_separating(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"Batch: {len(files)} files queued")
+        self._batch_worker.start()
+
+    def _on_batch_file_done(self, path: str, ok: bool, message: str):
+        name = os.path.basename(path)
+        self.statusBar().showMessage(
+            f"✓ {name} → {message}" if ok else f"✗ {name}: {message}"
+        )
+
+    def _on_batch_done(self, ok: int, failed: int, cancelled: bool):
+        self._set_separating(False)
+        self.progress_bar.setValue(0 if cancelled else 100)
+        summary = f"Batch {'cancelled' if cancelled else 'complete'}: {ok} done, {failed} failed"
+        self.progress_label.setText(summary)
+        self.statusBar().showMessage(summary)
+        if not cancelled and ok:
+            reply = QMessageBox.question(
+                self, "Batch complete", f"{summary}.\n\nOpen the output folder?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._open_path(self._batch_out_root)
+
+    @staticmethod
+    def _open_path(path: str):
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+    def export_click_track(self):
+        """Write a metronome track aligned to the analysed beats."""
+        info = self._analysis_result
+        if not info:
+            return
+        base = Path(self.current_audio_path).stem if getattr(self, 'current_audio_path', None) else "track"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Click Track",
+            os.path.join(self.working_directory, f"{_safe_filename(base)}_click_{info['bpm']:.0f}bpm.wav"),
+            EXPORT_FILTERS['wav']
+        )
+        if not file_path:
+            return
+
+        def job():
+            from audio_analysis import AudioAnalyzer
+            an = AudioAnalyzer()
+            click = an.generate_click_track(info['beat_times'], info['duration_sec'])
+            os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+            sf.write(file_path, click.T, an.sample_rate)
+            return file_path
+
+        self._run_task(job, lambda p: self.statusBar().showMessage(f"Click track saved: {p}"))
 
     def analyze_track(self):
         """Run BPM/key/loudness analysis on the loaded file in a worker thread."""
@@ -1371,11 +1634,14 @@ class TrachSplitterGUI(QMainWindow):
 
     def _on_analysis_done(self, result: dict):
         self.analyze_btn.setEnabled(True)
+        self._analysis_result = result
+        self.click_btn.setEnabled(True)
+        lufs = f"{result['lufs']} LUFS  ·  " if result.get('lufs') is not None else ""
         self.analysis_label.setText(
             f"<b>{result['bpm']} BPM</b>  ·  "
             f"<b>{result['key']} {result['mode']}</b>  ·  "
             f"{result['duration_sec']} s<br>"
-            f"RMS {result['rms_db']} dB  ·  Peak {result['peak_db']} dB  ·  "
+            f"{lufs}Peak {result['peak_db']} dB  ·  RMS {result['rms_db']} dB  ·  "
             f"key confidence {result['key_confidence']:.2f}"
         )
         self._restyle_label(self.analysis_label, "analysis_result")
@@ -1398,6 +1664,10 @@ class TrachSplitterGUI(QMainWindow):
         self.file_path_label.setToolTip(file_path)
         self._restyle_label(self.file_path_label, "file_loaded")
         self.current_audio_path = file_path
+        self._analysis_result = None
+        self.click_btn.setEnabled(False)
+        self._restyle_label(self.analysis_label, "hint")
+        self.analysis_label.setText("BPM, key and loudness of the loaded file.")
         self._add_recent_file(file_path)
         self.statusBar().showMessage(f"Loaded: {os.path.basename(file_path)}")
 
@@ -1439,45 +1709,89 @@ class TrachSplitterGUI(QMainWindow):
             return
         model_name = current_model
         if self.separator and self.separator.model_name != model_name:
-            self.statusBar().showMessage(f"Loading {model_name}...")
-            self.separate_btn.setEnabled(False)
-            self._model_worker = ModelLoadWorker(model_name, self.config.get('device', 'cpu'))
-            self._model_worker.finished.connect(self._on_model_changed_done)
-            self._model_worker.error.connect(self._on_model_load_error)
-            self._model_worker.start()
+            self._start_model_load(model_name, self.config.get('device'))
 
-    def _on_model_changed_done(self, separator):
-        self.separator = separator
-        self.config.set('model', separator.model_name)
-        self.statusBar().showMessage(f"Model loaded: {separator.model_name}")
-        self.sync_stem_controls()
-        self.update_info()
-        self.separate_btn.setEnabled(True)
+    def on_device_changed(self, device: str):
+        """Persist the device and reload the current model on it."""
+        self._save_setting('device', device)
+        if self.separator and self.separator.device != device:
+            self._start_model_load(self.separator.model_name, device)
 
     def load_model(self):
         """Load initial model in background thread."""
-        device = self.config.get('device', 'cpu')
-        default_model = self.config.get('model', 'htdemucs')
-        self.statusBar().showMessage("Loading model...")
-        self.separate_btn.setEnabled(False)
-        self._model_worker = ModelLoadWorker(default_model, device)
-        self._model_worker.finished.connect(self._on_model_loaded)
-        self._model_worker.error.connect(self._on_model_load_error)
-        self._model_worker.start()
+        self._start_model_load(
+            self.config.get('model', 'htdemucs'), self.config.get('device')
+        )
+
+    def _start_model_load(self, model_name: str, device: Optional[str]):
+        """Load a model off-thread; controls stay locked until it lands."""
+        if self._is_busy():
+            QMessageBox.information(
+                self, "Busy", "Wait for the running separation to finish before switching."
+            )
+            if self.separator:
+                self.set_model_combo(self.separator.model_name)
+            return
+        self.statusBar().showMessage(f"Loading {model_name}…")
+        self.progress_label.setText(
+            f"Loading model {model_name}… (downloaded automatically on first use)"
+        )
+        self._set_model_controls_enabled(False)
+        worker = ModelLoadWorker(model_name, device)
+        self._model_workers.append(worker)
+        worker.finished.connect(self._on_model_loaded)
+        worker.error.connect(self._on_model_load_error)
+        worker.finished.connect(lambda _=None, w=worker: self._release_model_worker(w))
+        worker.error.connect(lambda _=None, w=worker: self._release_model_worker(w))
+        worker.start()
+
+    def _release_model_worker(self, worker):
+        # Defer: the signal fires from inside the thread's run(); wait for exit
+        def _drop():
+            worker.wait()
+            if worker in self._model_workers:
+                self._model_workers.remove(worker)
+            worker.deleteLater()
+        QTimer.singleShot(0, _drop)
+
+    def _set_model_controls_enabled(self, enabled: bool):
+        self.separate_btn.setEnabled(enabled)
+        self.batch_btn.setEnabled(enabled)
+        self.model_combo.setEnabled(enabled)
+        self.device_combo.setEnabled(enabled)
 
     def _on_model_loaded(self, separator):
         self.separator = separator
         self.config.set('model', separator.model_name)
-        self.statusBar().showMessage("Model loaded successfully")
+        self.config.save()
+        self.statusBar().showMessage(f"Model ready: {separator.model_name} on {separator.device.upper()}")
+        self.progress_label.setText("Ready")
         self.set_model_combo(separator.model_name)
+        self.device_combo.blockSignals(True)
+        self.device_combo.setCurrentText(separator.device)
+        self.device_combo.blockSignals(False)
         self.sync_stem_controls()
         self.update_info()
-        self.separate_btn.setEnabled(True)
+        self._set_model_controls_enabled(True)
 
     def _on_model_load_error(self, error: str):
-        QMessageBox.critical(self, "Error", f"Failed to load model: {error}")
         logger.error(f"Model loading error: {error}")
-        self.separate_btn.setEnabled(True)
+        hint = ""
+        low = error.lower()
+        if any(k in low for k in ("urlopen", "connection", "getaddrinfo", "timed out", "ssl")):
+            hint = "\n\nThe model could not be downloaded — check your internet connection."
+        QMessageBox.critical(self, "Error", f"Failed to load model: {error}{hint}")
+        self.progress_label.setText("Model failed to load")
+        self._set_model_controls_enabled(True)
+        if self.separator:
+            # Roll the UI back to the model that is actually loaded
+            self.model_combo.blockSignals(True)
+            self.set_model_combo(self.separator.model_name)
+            self.model_combo.blockSignals(False)
+            self.sync_stem_controls()
+        else:
+            self.separate_btn.setEnabled(False)
+            self.batch_btn.setEnabled(False)
 
     def set_model_combo(self, model_name: str):
         """Select a model in the combo box by model id."""
@@ -1520,23 +1834,8 @@ class TrachSplitterGUI(QMainWindow):
             self.two_stems_combo.setCurrentText("Disabled")
         self.two_stems_combo.blockSignals(False)
 
-    def start_separation(self):
-        """Start audio separation."""
-        if not hasattr(self, 'current_audio_path'):
-            QMessageBox.warning(self, "Warning", "Please select an audio file first")
-            return
-
-        if not os.path.exists(self.current_audio_path):
-            QMessageBox.critical(self, "Error", "Audio file not found")
-            return
-
-        self.separate_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("Separating...")
-        self.stem_output_list.clear()
-        self.preview_files.clear()
-        self.current_preview_stem = None
-
+    def _separation_choice(self):
+        """(two_stems, stem_sources) from the current UI selection."""
         selected_stems = [
             stem for stem, checkbox in self.stem_checkboxes.items()
             if checkbox.isChecked() and checkbox.isEnabled()
@@ -1544,8 +1843,61 @@ class TrachSplitterGUI(QMainWindow):
         two_stems = self.two_stems_combo.currentText()
         if two_stems == "Disabled":
             two_stems = None
-
         stem_sources = None if two_stems else (selected_stems or None)
+        return two_stems, stem_sources
+
+    def _apply_separation_params(self):
+        """Push the Advanced segment/shifts values into the loaded separator."""
+        seg = self.segment_spin.value()
+        self.separator.segment = seg if seg > 0 else None
+        self.separator.shifts = self.shifts_spin.value()
+
+    def _set_separating(self, busy: bool):
+        self.separate_btn.setEnabled(not busy)
+        self.batch_btn.setEnabled(not busy)
+        self.model_combo.setEnabled(not busy)
+        self.device_combo.setEnabled(not busy)
+        self.cancel_btn.setEnabled(busy)
+        self.cancel_btn.setText("Cancel")
+
+    def cancel_separation(self):
+        """Stop the running single or batch separation."""
+        running = [w for w in (self.worker, self._batch_worker) if w and w.isRunning()]
+        if not running:
+            return
+        for w in running:
+            w.cancel()
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancelling…")
+        self.progress_label.setText("Cancelling after the current chunk…")
+
+    def start_separation(self):
+        """Start audio separation."""
+        if self._is_busy():
+            return
+        if not getattr(self, 'current_audio_path', None):
+            QMessageBox.warning(self, "Warning", "Please select an audio file first")
+            return
+
+        if not os.path.exists(self.current_audio_path):
+            QMessageBox.critical(self, "Error", "Audio file not found")
+            return
+
+        if self.separator is None:
+            QMessageBox.warning(self, "Please wait", "The model is still loading.")
+            return
+
+        self._set_separating(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Separating...")
+        self.stem_output_list.clear()
+        self.preview_files.clear()
+        self.current_preview_stem = None
+        self._separated_from = self.current_audio_path
+
+        two_stems, stem_sources = self._separation_choice()
+        self._apply_separation_params()
+        self._sep_started = time.monotonic()
 
         self.worker = SeparationWorker(
             self.separator,
@@ -1559,28 +1911,61 @@ class TrachSplitterGUI(QMainWindow):
         self.worker.progress_update.connect(self.update_progress)
         self.worker.finished.connect(self.on_separation_finished)
         self.worker.error.connect(self.on_separation_error)
+        self.worker.cancelled.connect(self.on_separation_cancelled)
         self.worker.start()
 
     def update_progress(self, msg: str, value: int):
         """Update progress bar."""
+        if not self.cancel_btn.isEnabled() and self._is_busy():
+            return  # cancelling — keep the "Cancelling…" message
         self.progress_label.setText(msg)
         self.progress_bar.setValue(value)
 
     def on_separation_finished(self, stems: Dict[str, np.ndarray]):
         """Handle separation completion."""
         self.stems = stems
-        self.progress_label.setText(f"Completed! Extracted {len(stems)} stems")
+        took = time.monotonic() - getattr(self, '_sep_started', time.monotonic())
+        self.progress_label.setText(f"Completed! Extracted {len(stems)} stems in {took:.0f}s")
         self.progress_bar.setValue(100)
-        self.separate_btn.setEnabled(True)
+        self._set_separating(False)
         self.statusBar().showMessage("Separation complete")
         self.populate_stem_outputs()
+        self.rebuild_mixer(list(stems.keys()))
         self.sync_stem_controls()
+        if self.auto_save_check.isChecked():
+            self._auto_save_stems()
+
+    def _auto_save_stems(self):
+        """Write stems to <working dir>/<track>/ without asking."""
+        track = Path(getattr(self, '_separated_from', 'track')).stem
+        out_dir = os.path.join(self.working_directory, _safe_filename(track))
+        fmt = self._output_format()
+        bitrate = f"{self.bitrate_spin.value()}k"
+        float32 = fmt == 'wav' and self.float32_check.isChecked()
+        stems = dict(self.stems)
+        editor = self.editor
+
+        def job():
+            os.makedirs(out_dir, exist_ok=True)
+            for name, audio in stems.items():
+                TrachSplitterGUI.write_export(
+                    editor, os.path.join(out_dir, f"{name}.{fmt}"), audio, fmt, bitrate, float32
+                )
+            return out_dir
+
+        self._run_task(job, lambda d: self.statusBar().showMessage(f"Stems auto-saved to {d}"))
+
+    def on_separation_cancelled(self):
+        self._set_separating(False)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Separation cancelled")
+        self.statusBar().showMessage("Cancelled")
 
     def on_separation_error(self, error: str):
         """Handle separation error."""
+        self._set_separating(False)
         QMessageBox.critical(self, "Separation Error", self.format_separation_error(error))
         self.progress_label.setText("Error during separation")
-        self.separate_btn.setEnabled(True)
 
     def format_separation_error(self, error: str) -> str:
         """Return a more actionable separation error message."""
@@ -1864,16 +2249,92 @@ class TrachSplitterGUI(QMainWindow):
             weights[stem] = 10 ** (slider.value() / 20.0)
         return weights
 
-    def apply_preset(self, mute_set: set):
-        """Apply a preset: reset all controls, then mute stems in mute_set."""
+    def rebuild_mixer(self, stem_names: list):
+        """Create one mixer row per separated stem (4, 6 or karaoke pair)."""
+        while self.mixer_rows_layout.count():
+            item = self.mixer_rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.mixer_rows.clear()
+        self.stem_sliders.clear()
+        self.stem_labels.clear()
+        self.stem_mutes.clear()
+        self.stem_solos.clear()
+        self.stem_pans.clear()
+
+        order = {s: i for i, s in enumerate(ALL_STEMS)}
+        names = sorted(stem_names, key=lambda s: (order.get(s.replace('no_', ''), 99), s))
+        for stem in names:
+            row_w = QWidget()
+            row = QHBoxLayout(row_w)
+            row.setContentsMargins(0, 0, 0, 0)
+
+            label = "Everything but " + stem[3:] if stem.startswith('no_') else stem.capitalize()
+            name_lbl = QLabel(label)
+            name_lbl.setMinimumWidth(60)
+            row.addWidget(name_lbl, 2)
+
+            mute_btn = QPushButton("M")
+            mute_btn.setObjectName("mute_btn")
+            mute_btn.setCheckable(True)
+            mute_btn.setFixedSize(28, 28)
+            mute_btn.setToolTip("Mute")
+            self.stem_mutes[stem] = mute_btn
+            row.addWidget(mute_btn)
+
+            solo_btn = QPushButton("S")
+            solo_btn.setObjectName("solo_btn")
+            solo_btn.setCheckable(True)
+            solo_btn.setFixedSize(28, 28)
+            solo_btn.setToolTip("Solo — silence all other stems")
+            self.stem_solos[stem] = solo_btn
+            solo_btn.clicked.connect(lambda checked, s=stem: self._handle_solo(s, checked))
+            row.addWidget(solo_btn)
+
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setMinimum(-60)
+            slider.setMaximum(12)
+            slider.setValue(0)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            slider.setTickInterval(6)
+            slider.setToolTip("Volume in dB")
+            self.stem_sliders[stem] = slider
+            row.addWidget(slider, 5)
+
+            db_lbl = QLabel("+0 dB")
+            db_lbl.setMinimumWidth(52)
+            self.stem_labels[stem] = db_lbl
+            slider.valueChanged.connect(
+                lambda val, s=stem, lbl=db_lbl: self.update_slider_label(s, val, lbl)
+            )
+            row.addWidget(db_lbl, 1)
+
+            pan_slider = QSlider(Qt.Orientation.Horizontal)
+            pan_slider.setMinimum(-100)
+            pan_slider.setMaximum(100)
+            pan_slider.setValue(0)
+            pan_slider.setToolTip("Pan: left ↔ right (presets reset to center)")
+            pan_slider.setMaximumWidth(120)
+            self.stem_pans[stem] = pan_slider
+            row.addWidget(pan_slider, 2)
+
+            self.mixer_rows[stem] = row_w
+            self.mixer_rows_layout.addWidget(row_w)
+        self.mixer_empty_label.setVisible(not names)
+
+    def apply_preset(self, preset: str):
+        """Apply a named preset: reset all controls, then mute per preset."""
+        active = preset_active_stems(preset, self.stem_sliders.keys())
         for stem in self.stem_sliders:
             self.stem_sliders[stem].setValue(0)
             if stem in self.stem_mutes:
-                self.stem_mutes[stem].setChecked(stem in mute_set)
+                self.stem_mutes[stem].setChecked(stem not in active)
             if stem in self.stem_solos:
                 self.stem_solos[stem].setChecked(False)
             if stem in self.stem_pans:
                 self.stem_pans[stem].setValue(0)
+        if self.stem_sliders:
+            self.statusBar().showMessage(f"Preset: {preset}")
 
     def _handle_solo(self, stem: str, checked: bool):
         """When a stem is soloed, un-solo all others."""
@@ -1887,24 +2348,18 @@ class TrachSplitterGUI(QMainWindow):
         if not self.stems:
             QMessageBox.warning(self, "Warning", "No stems — separate audio first.")
             return
-        preset_mutes = {
-            "Full Mix":        set(),
-            "Instrumental":    {"vocals"},
-            "Vocals Only":     {"drums", "bass", "other", "guitar", "piano"},
-            "Drums + Bass":    {"vocals", "other", "guitar", "piano"},
-        }
         preset = self.quick_preset_combo.currentText()
-        muted = preset_mutes.get(preset, set())
-        weights = {s: 1.0 for s in self.stems if s not in muted}
+        weights = {s: 1.0 for s in preset_active_stems(preset, self.stems.keys())}
         if not weights:
             QMessageBox.warning(self, "Warning", "No active stems for this preset.")
             return
-        safe_name = preset.lower().replace(" ", "_").replace("+", "and")
+        safe_name = preset.lower().replace(" / ", "_").replace(" ", "_").replace("+", "and")
+        track = Path(getattr(self, '_separated_from', '') or 'mix').stem
         fmt = self._output_format()
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Mix As",
-            os.path.join(self.working_directory, f"mix_{safe_name}.{fmt}"),
-            "WAV Files (*.wav);;MP3 Files (*.mp3);;FLAC Files (*.flac)"
+            os.path.join(self.working_directory, f"{_safe_filename(track)}_{safe_name}.{fmt}"),
+            ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
             return
@@ -1943,7 +2398,7 @@ class TrachSplitterGUI(QMainWindow):
             self,
             "Save Merged Stems As",
             os.path.join(self.working_directory, default_name),
-            "WAV Files (*.wav);;MP3 Files (*.mp3);;FLAC Files (*.flac)"
+            ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
             return
@@ -1985,9 +2440,23 @@ class TrachSplitterGUI(QMainWindow):
             'reverb_room': self.reverb_size.value(),
             'fade_in_ms': self.fade_in_spin.value(),
             'fade_out_ms': self.fade_out_spin.value(),
-            'normalize': self.normalize_check.isChecked(),
+            'normalize_mode': self.normalize_mode.currentText(),
             'normalize_db': self.normalize_target.value(),
+            'pitch': self.pitch_spin.value(),
+            'tempo': self.tempo_spin.value() / 100.0,
         }
+
+    def _on_normalize_mode(self, index: int):
+        """Swap the target range/units to match the normalize mode."""
+        self.normalize_target.setEnabled(index != 0)
+        self.normalize_target.blockSignals(True)
+        if index == 2:
+            self.normalize_target.setSuffix(" LUFS")
+            self.normalize_target.setValue(float(self.config.get('loudness_target', -14.0)))
+        else:
+            self.normalize_target.setSuffix(" dB")
+            self.normalize_target.setValue(-1.0)
+        self.normalize_target.blockSignals(False)
 
     @staticmethod
     def render_mix(stems: Dict[str, np.ndarray], params: Dict, editor: AudioEditor) -> Optional[np.ndarray]:
@@ -2004,19 +2473,29 @@ class TrachSplitterGUI(QMainWindow):
         mix = editor.mix_stems(active, weights, normalize=True)
 
         if any(abs(g) >= 0.1 for g in params['eq_gains']):
-            mix = editor.apply_eq(mix, params['eq_freqs'], params['eq_gains'])
+            mix = editor.apply_eq(mix, params['eq_freqs'], params['eq_gains'], shelf_edges=True)
         if params['denoise']:
             mix = editor.reduce_noise(mix, strength=params['denoise_strength'])
         if params['compress']:
             mix = editor.apply_compression(mix, ratio=params['comp_ratio'])
         if params['reverb']:
             mix = editor.apply_reverb(mix, room_size=params['reverb_room'])
+        if abs(params.get('pitch', 0.0)) >= 0.05:
+            mix = editor.pitch_shift(mix, params['pitch'])
+        if abs(params.get('tempo', 1.0) - 1.0) >= 0.005:
+            mix = editor.time_stretch(mix, params['tempo'])
         if params['fade_in_ms'] > 0:
             mix = editor.fade_in(mix, params['fade_in_ms'])
         if params['fade_out_ms'] > 0:
             mix = editor.fade_out(mix, params['fade_out_ms'])
-        if params['normalize']:
+        mode = params.get('normalize_mode', 'Off')
+        if mode == 'Peak':
             mix = editor.normalize(mix, params['normalize_db'])
+        elif mode.startswith('Loudness'):
+            mix = editor.normalize_loudness(mix, target_lufs=params['normalize_db'])
+        else:
+            # Effects (EQ boosts, reverb, pitch) can push past full scale
+            mix = editor.limit(mix, -0.3)
         return mix
 
     def _render_mix(self) -> Optional[np.ndarray]:
@@ -2092,18 +2571,13 @@ class TrachSplitterGUI(QMainWindow):
             return
 
         fmt = self._output_format()
-        filters = {
-            'wav': "WAV Files (*.wav)",
-            'mp3': "MP3 Files (*.mp3)",
-            'flac': "FLAC Files (*.flac)",
-        }
-        all_filters = ";;".join(filters.values())
+        track = Path(getattr(self, '_separated_from', '') or 'mix').stem
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Mix As",
-            os.path.join(self.working_directory, f"mix.{fmt}"),
-            all_filters,
-            filters.get(fmt, filters['wav'])
+            os.path.join(self.working_directory, f"{_safe_filename(track)}_mix.{fmt}"),
+            ";;".join(EXPORT_FILTERS.values()),
+            EXPORT_FILTERS.get(fmt, EXPORT_FILTERS['wav'])
         )
 
         if not file_path:
@@ -2148,9 +2622,9 @@ class TrachSplitterGUI(QMainWindow):
                 "Drag-select a region on the spectrogram first (click and drag on the lower plot)."
             )
             return
-        audio = self.stems[names[0]] if len(names) == 1 else self._mix_selected(names)
+        length = self.stems[names[0]].shape[-1]
         start = max(0, int(selection[0] * 44100))
-        end = min(audio.shape[-1], int(selection[1] * 44100))
+        end = min(length, int(selection[1] * 44100))
         if end - start < 441:  # <10 ms
             QMessageBox.warning(self, "Warning", "Selection is too short.")
             return
@@ -2161,16 +2635,18 @@ class TrachSplitterGUI(QMainWindow):
             self,
             "Export Selection As",
             os.path.join(self.working_directory, default_name),
-            "WAV Files (*.wav);;MP3 Files (*.mp3);;FLAC Files (*.flac)"
+            ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
             return
-        clip = audio[..., start:end]
         editor = self.editor
         efmt, bitrate, float32 = self._export_params(file_path)
         self._set_rendering(True, "Exporting selection…")
 
         def job():
+            # Slice before mixing: only the selected region is processed
+            clips = {n: self.stems[n][..., start:end] for n in names}
+            clip = clips[names[0]] if len(names) == 1 else editor.mix_stems(clips, normalize=True)
             return TrachSplitterGUI.write_export(editor, file_path, clip, efmt, bitrate, float32)
 
         def on_done(written):
@@ -2211,6 +2687,20 @@ class TrachSplitterGUI(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.config.reset_to_defaults()
+            for combo, value in (
+                (self.device_combo, self.config.get('device')),
+                (self.format_combo, self.config.get('output_format')),
+            ):
+                combo.blockSignals(True)
+                combo.setCurrentText(value)
+                combo.blockSignals(False)
+            self.bitrate_spin.setValue(int(self.config.get('output_bitrate', 320)))
+            self.float32_check.setChecked(False)
+            self.auto_save_check.setChecked(False)
+            self.segment_spin.setValue(0)
+            self.shifts_spin.setValue(1)
+            self.working_directory = str(Path.home() / "Music" / "TrachSplitter")
+            self.dir_label.setText(self.working_directory)
             self.load_model()
 
     def update_info(self):
@@ -2239,6 +2729,21 @@ class TrachSplitterGUI(QMainWindow):
 
     def closeEvent(self, event):
         """Save config on exit and clean up temp files."""
+        if self._is_busy():
+            reply = QMessageBox.question(
+                self, "Separation running",
+                "A separation is still running. Cancel it and quit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            for w in (self.worker, self._batch_worker):
+                if w and w.isRunning():
+                    w.cancel()
+                    w.wait(30000)
+        for w in list(self._model_workers) + list(self._task_workers):
+            w.wait(10000)
         self.player.stop()
         self.player.setSource(QUrl())
         geo = self.geometry()
@@ -2252,9 +2757,15 @@ class TrachSplitterGUI(QMainWindow):
 
 def main():
     """Run the application."""
+    log_dir = Path.home() / '.trachsplitter'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handlers = [logging.FileHandler(log_dir / 'app.log', encoding='utf-8')]
+    if sys.stderr is not None:  # windowed builds have no console
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
     )
 
     from PySide6.QtWidgets import QApplication
