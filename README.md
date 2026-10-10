@@ -1,168 +1,196 @@
 # TrachSplitter
 
-> AI-powered audio stem separation and mixing — powered by Meta's [Demucs v4](https://github.com/facebookresearch/demucs).
+> AI stem separation and mixing on your own computer, powered by Meta's [Demucs v4](https://github.com/facebookresearch/demucs).
 
-Split any song into isolated stems (vocals, drums, bass, guitar, piano, other), mix them with per-stem volume/mute/solo controls, apply EQ & effects, and export — all from a single desktop app.
+Split any song into vocals, drums, bass, guitar, piano and other. Then remix the stems, change the key or speed, hit a streaming loudness target and export. Everything runs locally; your audio never leaves your machine.
 
 ---
 
 ## Screenshots
 
-> **Separation tab** — load a file, pick a model, separate in one click.
+**Separate**: drop a song, pick a model, separate. Each stem keeps its own colour across the list, the waveform and the mixer.
 
-![Separation Tab](docs/screenshots/separation.png)
+![Separate page](docs/screenshots/separation.png)
 
-> **Editing & Mixing tab** — Mute / Solo / Volume per stem, presets, EQ, effects, live preview.
+**Mix**: volume, mute, solo and pan per stem, presets, 5-band EQ, dynamics, pitch & speed, loudness. **Export My Mix…** saves exactly what you hear.
 
-![Mixing Tab](docs/screenshots/mixing.png)
+![Mix page](docs/screenshots/mixing.png)
 
-> **Quick Export** — pick a preset and export directly from the Separation tab without touching the mixer.
+**Dark mode** follows your system appearance automatically.
 
-![Quick Export](docs/screenshots/quick_export.png)
+![Dark mode](docs/screenshots/dark_mode.png)
+
+<details>
+<summary>More: first launch and Settings</summary>
+
+![Empty state](docs/screenshots/empty_state.png)
+
+![Settings](docs/screenshots/settings.png)
+
+</details>
 
 ---
 
 ## Features
 
-| Feature | Detail |
-|---------|--------|
-| **7 Demucs models** | htdemucs, htdemucs_ft, htdemucs_6s, hdemucs_mmi, mdx, mdx_extra, mdx_q |
+### Separation
+| | |
+|---|---|
+| **8 Demucs models** | htdemucs, htdemucs_ft, htdemucs_6s, hdemucs_mmi, mdx, mdx_extra, mdx_q, mdx_extra_q |
 | **Up to 6 stems** | Vocals · Drums · Bass · Guitar · Piano · Other |
-| **Karaoke mode** | Extract a single stem vs. everything else |
-| **Stem mixer** | Per-stem Volume · Mute · Solo · 5-band EQ |
-| **Quick presets** | Full Mix · Instrumental · Vocals Only · Drums+Bass · Ambient |
-| **Stem mixer extras** | Per-stem constant-power Pan · Fade in/out · Normalize to target dB |
-| **Effects** | Compression · Reverb · De-noise (spectral gate) |
-| **In-app playback** | Play stems and mix previews inside the app with click-to-seek and live playhead (system player still available) |
-| **Track analysis** | BPM, musical key, and loudness detection (GUI + `cli.py analyze`, optional click track) |
-| **Spectrogram viewer** | Waveform + frequency spectrogram per stem with drag-to-select and **Export Selection** |
-| **Workflow** | Drag & drop loading · Recent files · Settings persist across restarts |
-| **Batch CLI** | Separate entire folders from the command line |
-| **GPU acceleration** | CUDA (NVIDIA) or CPU fallback |
+| **Two-stem mode** | One stem + everything else, e.g. acapella + karaoke backing track |
+| **Batch processing** | Pick many files or drop a folder; each track's stems go to their own folder |
+| **Cancel + ETA** | Live progress with time remaining; cancel any time (Esc) |
+| **Auto-save** | Optionally write stems to `<working folder>/<track>/` after every separation |
+| **GPU acceleration** | NVIDIA CUDA, Apple Silicon (MPS), or CPU |
 
----
+### Mixing & effects
+| | |
+|---|---|
+| **Stem mixer** | Volume · Mute · Solo · constant-power Pan per stem |
+| **Presets** | Full Mix · Instrumental · Vocals Only · Drums + Bass · Drumless · Bassless · Ambient |
+| **Tone** | 5-band EQ (low/high shelves + peaking mids) |
+| **Dynamics & space** | Compression · Reverb · De-noise (spectral gate) |
+| **Pitch & speed** | Transpose ±12 semitones, 25–200 % tempo, independently: a practice tool |
+| **Loudness** | Peak normalize, or LUFS loudness target (−14 Spotify/YouTube, −16 Apple Music) with a true limiter |
+| **Fades** | Fade in / fade out |
 
-## Download
+### Analysis & export
+| | |
+|---|---|
+| **Track analysis** | BPM, musical key, integrated loudness (LUFS) |
+| **Click track** | Metronome aligned to the detected beats |
+| **Waveform + spectrogram** | Click to seek, drag to select, **Export Selection** |
+| **Formats** | WAV (16-bit or 32-bit float) · FLAC · OGG · MP3 (128–320 kbps) |
+| **In-app playback** | Play stems or a rendered mix preview with a live playhead |
 
-Pre-built binaries (no Python required):
-
-| Platform | Download |
-|----------|---------|
-| Windows 10/11 | `TrachSplitter-1.0.0-windows.zip` |
-| macOS 12+ | `TrachSplitter-1.0.0-mac.dmg` |
-| Linux (x86-64) | `TrachSplitter-1.0.0-linux.tar.gz` |
-
-> **Note:** Demucs AI models (~100–400 MB each) are downloaded automatically on first use and cached in `~/.cache/torch/hub/`.
+### App
+- Sidebar navigation with recent files, full menu bar with keyboard shortcuts (F1 lists them)
+- Light and dark appearance following the system, accessible contrast (≥ 4.5:1 text)
+- Inline notifications with **Show in Folder** instead of pop-ups
+- Drag & drop files or folders anywhere on the window
+- Works without FFmpeg for WAV / FLAC / OGG / MP3 input
 
 ---
 
 ## Quick Start
 
-### GUI
+### Run from source
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Launch
-python gui.py
+python main.py
 ```
 
-1. **Separation tab** → Browse → pick model → Separate Audio
-2. Select a stem from the list to see its spectrogram
-3. Click **Open Selected Stem in Music Player** to audition
-4. Use **Quick Export** to save a preset mix immediately, _or_
-5. Switch to **Editing & Mixing** for full control
+1. **Separate**: drop a song (or **Open…**, Ctrl+O), choose a model, click **Separate** (Ctrl+Enter).
+2. Click a stem to see its waveform; **Play** (Space) to listen.
+3. **Save All Stems…** or **Quick export** a preset (Instrumental, Vocals Only, …).
+4. **Mix** (Ctrl+2): balance stems, add effects, then **Export My Mix…** (Ctrl+E).
+
+### Keyboard shortcuts
+
+| Action | Shortcut |
+|---|---|
+| Open file | Ctrl+O |
+| Separate / Cancel | Ctrl+Enter / Esc |
+| Batch separate | Ctrl+B |
+| Play / Stop | Space |
+| Preview mix | Ctrl+P |
+| Save (mix on Mix page, otherwise stems) | Ctrl+S |
+| Export my mix | Ctrl+E |
+| Save all stems | Ctrl+Shift+S |
+| Analyze track | Ctrl+I |
+| Separate / Mix page | Ctrl+1 / Ctrl+2 |
+| Settings | Ctrl+, |
 
 ### CLI
 
 ```bash
-# Separate a single file
-python cli.py separate track.mp3 --model htdemucs --device cuda
+# Separate a single file (stems in separated/<model>/<track>/)
+python cli.py separate track.mp3 --model htdemucs -f flac
 
-# Karaoke (remove vocals)
-python cli.py separate track.mp3 --two-stems vocals
+# Karaoke: vocals + no_vocals (instrumental)
+python cli.py karaoke track.mp3 -f mp3
 
-# Mix stems with custom gains
-python cli.py mix ./separated/ -o mix.wav --gains vocals:3 drums:-2
+# Tempo, key, loudness (+ optional click track)
+python cli.py analyze track.mp3 --click click.wav
 
-# Batch-process a folder
-python cli.py batch ./songs/ -o ./stems/ --model htdemucs_ft
+# Mix stems: gains, mutes, loudness target
+python cli.py mix ./separated/htdemucs/track -o mix.wav -g drums:3 --mute vocals --lufs -14
+
+# Batch a folder (recursive, skip tracks already done)
+python cli.py batch ./songs -o ./stems -m htdemucs_ft -r --skip-existing
 ```
+
+`--device` defaults to the best available (cuda → mps → cpu).
 
 ---
 
 ## Models
 
-| Model | Stems | Speed | Quality |
-|-------|-------|-------|---------|
-| `htdemucs` | 4 | Fast | Good — **recommended default** |
-| `htdemucs_ft` | 4 | Slow | Best quality |
-| `htdemucs_6s` | 6 | Slow | Best for guitar & piano |
-| `hdemucs_mmi` | 4 | Medium | Alternative architecture |
-| `mdx` | 4 | Fast | MDX architecture |
-| `mdx_extra` | 4 | Medium | Higher quality MDX |
-| `mdx_q` | 4 | Fast | Quantized, lower memory |
+| Model | Stems | Speed | Notes |
+|-------|-------|-------|-------|
+| `htdemucs` | 4 | Fast | **Recommended default** |
+| `htdemucs_ft` | 4 | Slow | Highest quality |
+| `htdemucs_6s` | 6 | Slow | Adds guitar & piano |
+| `hdemucs_mmi` | 4 | Medium | Stable alternative |
+| `mdx` | 4 | Fast | Lightweight |
+| `mdx_extra` | 4 | Medium | Better MDX |
+| `mdx_q` | 4 | Fast | Quantized, low memory |
+| `mdx_extra_q` | 4 | Fast | Smallest |
+
+Models download automatically on first use (~80–320 MB each) and are cached in `~/.cache/torch/hub/`.
 
 ---
 
-## Building Executables
+## Building the desktop app
 
-Standalone binaries must be built on the **target platform** (no cross-compilation).
+Build on the platform you're targeting (no cross-compilation).
 
 ```bash
-# Install build deps
-pip install pyinstaller cairosvg
+pip install pyinstaller
 
-# Build for current OS (produces dist/TrachSplitter/)
-python build.py
-
-# Single-file exe + zip/dmg package
-python build.py --onefile
-
-# Clean rebuild
-python build.py --clean
-
-# Skip packaging step
-python build.py --no-package
+python build.py --no-package   # dist/TrachSplitter/ (fastest; use for testing)
+python build.py                # + zip / dmg / tar.gz for sharing
+python build.py --clean        # full clean rebuild (slower)
+python build.py --onefile      # single-file executable
 ```
-
-Output locations:
 
 | Platform | Output |
 |----------|--------|
-| Windows | `dist/TrachSplitter/TrachSplitter.exe` + `dist/TrachSplitter-1.0.0-windows.zip` |
-| macOS | `dist/TrachSplitter.app` + `dist/TrachSplitter-1.0.0-mac.dmg` |
-| Linux | `dist/TrachSplitter/TrachSplitter` + `dist/TrachSplitter-1.0.0-linux.tar.gz` |
+| Windows | `dist/TrachSplitter/TrachSplitter.exe` (+ `dist/TrachSplitter-1.0.0-windows.zip`) |
+| macOS | `dist/TrachSplitter.app` (+ `.dmg`) |
+| Linux | `dist/TrachSplitter/TrachSplitter` (+ `.tar.gz`) |
 
-> The bundle is large (~1–2 GB) because PyTorch is included. This is expected.
+Notes:
+- Run the exe from `dist/`, not `build/` (the `build/` copy can't start on its own).
+- Close the app before rebuilding; a running copy locks its files (the script checks for this).
+- The build takes several minutes and the bundle is large (~4 GB with CUDA PyTorch). Both are expected.
+- Logs: `~/.trachsplitter/app.log` (Help › Show Log Folder).
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- FFmpeg on PATH (for MP3/M4A/OGG input — [ffmpeg.org](https://ffmpeg.org/download.html))
-- NVIDIA GPU + CUDA drivers (optional — CPU fallback works but is slower)
-
-```bash
-pip install -r requirements.txt
-```
+- Optional: NVIDIA GPU + CUDA drivers, or Apple Silicon, for fast separation (CPU works, slower)
+- Optional: FFmpeg on PATH for M4A/AAC input ([ffmpeg.org](https://ffmpeg.org/download.html))
 
 ---
 
-## Project Structure
+## Project structure
 
-```/
+```
 TrachSplitter/
+├── main.py                 # Entry point (dependency check → GUI)
 ├── gui.py                  # PySide6 desktop app
+├── ui_theme.py             # Design tokens, light/dark stylesheet, stem colours
 ├── cli.py                  # Command-line interface
-├── audio_editor.py         # Mixing, EQ, effects, normalisation
-├── demucs_separator.py     # Demucs v4 wrapper
-├── config.py               # App config + model registry
-├── build.py                # Cross-platform PyInstaller build script
-├── TrachSplitter.spec      # PyInstaller spec (advanced/manual builds)
-├── icon.svg                # App icon source (auto-converted by build.py)
+├── demucs_separator.py     # Demucs v4 wrapper (progress, cancel, fallback loading)
+├── audio_editor.py         # Mixing, EQ, effects, limiter, loudness, export
+├── audio_analysis.py       # BPM, key, LUFS (ITU-R BS.1770), click track
+├── config.py               # Settings + model registry
+├── build.py                # PyInstaller build script
 └── requirements.txt
 ```
 
@@ -170,12 +198,11 @@ TrachSplitter/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
----
+MIT
 
 ## Acknowledgements
 
-- [Demucs](https://github.com/facebookresearch/demucs) — Meta AI Research
-- [PySide6](https://doc.qt.io/qtforpython/) — Qt for Python
-- [PyInstaller](https://pyinstaller.org/) — packaging
+- [Demucs](https://github.com/facebookresearch/demucs): Meta AI Research
+- [PySide6](https://doc.qt.io/qtforpython/): Qt for Python
+- [librosa](https://librosa.org/), [SciPy](https://scipy.org/), [soundfile](https://github.com/bastibe/python-soundfile)
+- [PyInstaller](https://pyinstaller.org/): packaging

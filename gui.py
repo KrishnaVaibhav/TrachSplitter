@@ -15,13 +15,14 @@ from matplotlib.widgets import SpanSelector
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QFileDialog,
-    QProgressBar, QTableWidget, QTableWidgetItem, QTabWidget, QGroupBox,
+    QProgressBar, QTabWidget, QStackedWidget, QDialog,
     QListWidget, QListWidgetItem, QMessageBox, QSplitter, QFrame,
-    QScrollArea, QSizePolicy, QGridLayout, QApplication
+    QScrollArea, QSizePolicy, QGridLayout, QApplication, QStyleFactory
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QUrl
-from PySide6.QtGui import QIcon, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer, QUrl, QEvent
+from PySide6.QtGui import QIcon, QKeySequence, QAction
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+import ui_theme
 import subprocess
 import time
 
@@ -57,8 +58,12 @@ def preset_active_stems(preset: str, stem_names) -> set:
     return stem_names - names
 
 
-def _safe_filename(name: str) -> str:
-    return "".join(c if c.isalnum() or c in " ._-()" else "_" for c in name).strip() or "track"
+def _safe_filename(name: str, max_len: int = 80) -> str:
+    """Windows-safe file name: drop characters like | # : ? *, collapse runs."""
+    import re
+    cleaned = "".join(c if c.isalnum() or c in " ._-()&'," else " " for c in name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._-")
+    return cleaned[:max_len].rstrip(" ._-") or "track"
 
 from config import Config
 from demucs_separator import DemucsSeparator, SeparationCancelled
@@ -207,17 +212,13 @@ class AnalysisWorker(QThread):
 
 
 class AudioViewer(QFrame):
-    """Widget for displaying a stem spectrogram with click-to-seek."""
+    """Waveform + spectrogram of the selected stem, click to seek, drag to select.
+
+    Colours follow the app theme; the waveform takes the stem's identity colour.
+    """
 
     def __init__(self):
         super().__init__()
-        self.setObjectName("viewer_frame")
-        # Scope to this frame only — a bare QFrame selector would also box
-        # every child QLabel (QLabel derives from QFrame)
-        self.setStyleSheet(
-            "QFrame#viewer_frame { background-color: #1d2125; "
-            "border: 1px solid #3a4147; border-radius: 8px; }"
-        )
         self.audio = None
         self.sample_rate = 44100
         self.on_seek = None
@@ -226,18 +227,18 @@ class AudioViewer(QFrame):
         self.view_start = 0.0
         self.view_end = None
         self.selection = None
+        self.title = ""
+        self.wave_color = "#0066CC"
+        self.theme = ui_theme.tokens(False)
 
         layout = QVBoxLayout(self)
-        self.figure = Figure(figsize=(8, 4), facecolor="#1a1a1a")
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.figure = Figure(figsize=(8, 4))
         self.canvas = FigureCanvas(self.figure)
+        self.canvas.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.ax_wave = self.figure.add_subplot(211)
         self.ax_spec = self.figure.add_subplot(212, sharex=self.ax_wave)
-        for ax in [self.ax_wave, self.ax_spec]:
-            ax.set_facecolor("#111111")
-            ax.tick_params(colors="#d7f3f1", labelsize=8)
-            for spine in ax.spines.values():
-                spine.set_color("#666666")
-        self.ax_wave.set_title("Select a stem to inspect", color="#d7f3f1", fontsize=10)
         self.span = None
         self.playhead = None
         self._spec_data = None
@@ -247,30 +248,41 @@ class AudioViewer(QFrame):
         self._last_playhead_draw = 0.0
         self.canvas.mpl_connect("resize_event", lambda e: setattr(self, "_bg", None))
         self.canvas.mpl_connect("button_press_event", self._handle_click)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
 
         toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        toolbar.setSpacing(6)
         self.zoom_in_btn = QPushButton("Zoom In")
-        self.zoom_in_btn.setObjectName("secondary_btn")
+        self.zoom_in_btn.setToolTip("Zoom in around the centre")
         self.zoom_in_btn.clicked.connect(lambda: self.zoom(0.6))
         toolbar.addWidget(self.zoom_in_btn)
         self.zoom_out_btn = QPushButton("Zoom Out")
-        self.zoom_out_btn.setObjectName("secondary_btn")
         self.zoom_out_btn.clicked.connect(lambda: self.zoom(1.6))
         toolbar.addWidget(self.zoom_out_btn)
-        self.reset_zoom_btn = QPushButton("Reset")
-        self.reset_zoom_btn.setObjectName("secondary_btn")
+        self.reset_zoom_btn = QPushButton("Fit")
+        self.reset_zoom_btn.setToolTip("Show the whole track")
         self.reset_zoom_btn.clicked.connect(self.reset_zoom)
         toolbar.addWidget(self.reset_zoom_btn)
         toolbar.addSpacing(8)
-        self.selection_label = QLabel("Selection: none")
-        self.selection_label.setStyleSheet(
-            "color: #8fb8b8; font-size: 12px; border: none; background: transparent;"
-        )
+        self.selection_label = QLabel("Drag on the spectrogram to select a region")
+        self.selection_label.setObjectName("caption")
         toolbar.addWidget(self.selection_label)
         toolbar.addStretch()
         layout.addLayout(toolbar)
+        self.set_theme(self.theme)
+
+    def set_theme(self, theme: dict):
+        self.theme = theme
+        self.figure.set_facecolor(theme['surface'])
+        self.redraw()
+
+    def _style_axes(self):
+        t = self.theme
+        for ax in (self.ax_wave, self.ax_spec):
+            ax.set_facecolor(t['plot_bg'])
+            ax.tick_params(colors=t['secondary'], labelsize=8, length=3)
+            for spine in ax.spines.values():
+                spine.set_color(t['plot_grid'])
 
     def _handle_click(self, event):
         if self.audio is None or event.inaxes not in (self.ax_wave, self.ax_spec) or event.xdata is None:
@@ -310,6 +322,7 @@ class AudioViewer(QFrame):
         title: str,
         spec_data,
         wave_env,
+        color: Optional[str] = None,
     ):
         """Display precomputed view data (cheap, UI-thread safe)."""
         self.audio = True  # sentinel: data loaded
@@ -319,11 +332,14 @@ class AudioViewer(QFrame):
         self.view_end = duration
         self._spec_data = spec_data
         self._wave_env = wave_env
+        self.title = title
+        if color:
+            self.wave_color = color
         self.selection = None
-        self.selection_label.setText("Selection: none")
-        self.redraw(title)
+        self.selection_label.setText("Drag on the spectrogram to select a region")
+        self.redraw()
 
-    def set_audio(self, audio: np.ndarray, sample_rate: int = 44100, title: str = "Stem Spectrogram"):
+    def set_audio(self, audio: np.ndarray, sample_rate: int = 44100, title: str = ""):
         """Synchronous convenience wrapper (blocks — prefer the async path)."""
         spec_data, wave_env, duration = self.compute_view_data(audio, sample_rate)
         self.set_audio_precomputed(duration, sample_rate, title, spec_data, wave_env)
@@ -334,7 +350,7 @@ class AudioViewer(QFrame):
         self.selection = None
         self._spec_data = None
         self._wave_env = None
-        self.selection_label.setText("Selection: none")
+        self.selection_label.setText("Drag on the spectrogram to select a region")
         self.redraw()
 
     def update_playhead(self, seconds: Optional[float]):
@@ -355,7 +371,7 @@ class AudioViewer(QFrame):
         if self._bg is None:
             if self._ph_artists is None:
                 self._ph_artists = [
-                    ax.axvline(0, color="#00d4ff", linewidth=1.5, animated=True)
+                    ax.axvline(0, color=self.theme['content'], linewidth=1.2, animated=True)
                     for ax in (self.ax_wave, self.ax_spec)
                 ]
             self.canvas.draw()  # animated artists are excluded → clean background
@@ -367,46 +383,64 @@ class AudioViewer(QFrame):
             ln.axes.draw_artist(ln)
         self.canvas.blit(self.figure.bbox)
 
-    def redraw(self, title: str = "Stem Spectrogram", playhead_seconds: Optional[float] = None):
+    def redraw(self, title: Optional[str] = None, playhead_seconds: Optional[float] = None):
+        if title:
+            self.title = title
+        t = self.theme
         self._bg = None
         self._ph_artists = None  # cleared with the axes below
         self.ax_wave.clear()
         self.ax_spec.clear()
+        self._style_axes()
         if not self.audio:
-            self.ax_wave.set_title("Select a stem to inspect", color="#d7f3f1", fontsize=10)
+            for ax in (self.ax_wave, self.ax_spec):
+                ax.set_xticks([])
+                ax.set_yticks([])
+            self.ax_wave.text(
+                0.5, 0.5, "Select a stem to see its waveform",
+                ha="center", va="center", color=t['secondary'], fontsize=10,
+                transform=self.ax_wave.transAxes,
+            )
+            self.figure.tight_layout()
             self.canvas.draw_idle()
             return
 
         if self._wave_env is not None:
             times, lo, hi = self._wave_env
-            self.ax_wave.fill_between(times, lo, hi, color="#7bdff2", linewidth=0)
+            self.ax_wave.fill_between(times, lo, hi, color=self.wave_color, linewidth=0)
         self.ax_wave.set_xlim(self.view_start, self.view_end or self.duration)
-        self.ax_wave.set_ylabel("Amp", color="#d7f3f1")
-        self.ax_wave.set_title(title, color="#d7f3f1", fontsize=10)
-        f, t, sxx_db = self._spec_data
-        self.ax_spec.pcolormesh(t, f, sxx_db, shading="auto", cmap="magma")
+        self.ax_wave.set_yticks([])
+        self.ax_wave.tick_params(labelbottom=False)
+        f, tt, sxx_db = self._spec_data
+        # Clip to an 80 dB window below the loud end: digital silence sits at
+        # -200 dB and would otherwise push all real content into the top colours
+        vmax = float(np.percentile(sxx_db, 99.5)) if sxx_db.size else 0.0
+        self.ax_spec.pcolormesh(tt, f, sxx_db, shading="auto", cmap="magma",
+                                vmin=vmax - 80.0, vmax=vmax, rasterized=True)
         self.ax_spec.set_ylim(0, min(16000, self.sample_rate // 2))
         self.ax_spec.set_xlim(self.view_start, self.view_end or self.duration)
-        self.ax_spec.set_xlabel("Time (s)", color="#d7f3f1")
-        self.ax_spec.set_ylabel("Freq (Hz)", color="#d7f3f1")
-        self.ax_spec.tick_params(colors="#d7f3f1", labelsize=8)
+        self.ax_spec.set_xlabel("Time (s)", color=t['secondary'], fontsize=9)
+        self.ax_spec.set_ylabel("Hz", color=t['secondary'], fontsize=9)
         if self.span is None:
             self.span = SpanSelector(
                 self.ax_spec,
                 self._handle_span,
                 "horizontal",
                 useblit=True,
-                props=dict(alpha=0.25, facecolor="#00d4ff")
+                props=dict(alpha=0.25, facecolor=t['accent'])
             )
         if playhead_seconds is not None:
-            self.ax_wave.axvline(playhead_seconds, color="#00d4ff", linewidth=1.5)
-            self.ax_spec.axvline(playhead_seconds, color="#00d4ff", linewidth=1.5)
+            for ax in (self.ax_wave, self.ax_spec):
+                ax.axvline(playhead_seconds, color=t['content'], linewidth=1.2)
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
     def _handle_span(self, xmin, xmax):
         self.selection = (float(min(xmin, xmax)), float(max(xmin, xmax)))
-        self.selection_label.setText(f"Selection: {self.selection[0]:.2f}s - {self.selection[1]:.2f}s")
+        self.selection_label.setText(
+            f"Selected {self.selection[0]:.2f}s – {self.selection[1]:.2f}s "
+            f"({self.selection[1] - self.selection[0]:.2f}s)"
+        )
         if self.on_select:
             self.on_select(*self.selection)
 
@@ -499,20 +533,12 @@ class TrachSplitterGUI(QMainWindow):
         self._init_shortcuts()
         self.load_model()
 
-    def _init_shortcuts(self):
-        """Keyboard shortcuts for the most frequent actions."""
-        bindings = [
-            ("Ctrl+O", self.browse_audio_file),
-            ("Ctrl+Return", self.start_separation),
-            ("Ctrl+S", self.save_stems),
-            ("Ctrl+E", self.export_mix),
-            ("Ctrl+B", self.start_batch),
-            ("Space", self.toggle_playback),
-            ("Escape", self.cancel_separation),
-        ]
-        for keys, slot in bindings:
-            sc = QShortcut(QKeySequence(keys), self)
-            sc.activated.connect(slot)
+    def save_current(self):
+        """Ctrl+S: save the configured mix on the mixing tab, else the stems."""
+        if self.tabs.currentIndex() == 1:
+            self.export_mix()
+        else:
+            self.save_stems()
 
     def toggle_playback(self):
         """Space: stop if playing, else play the current context."""
@@ -572,11 +598,23 @@ class TrachSplitterGUI(QMainWindow):
                 paths.append(str(p))
         return paths
 
+    def _set_drop_highlight(self, on: bool):
+        zone = getattr(self, 'drop_zone', None)
+        if zone is not None:
+            zone.setProperty("active", "true" if on else "false")
+            zone.style().unpolish(zone)
+            zone.style().polish(zone)
+
     def dragEnterEvent(self, event):
         if self._audio_paths_from_urls(event.mimeData().urls()):
             event.acceptProposedAction()
+            self._set_drop_highlight(True)
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_highlight(False)
 
     def dropEvent(self, event):
+        self._set_drop_highlight(False)
         paths = self._audio_paths_from_urls(event.mimeData().urls())
         if not paths:
             return
@@ -586,20 +624,27 @@ class TrachSplitterGUI(QMainWindow):
         else:
             self.start_batch(paths)
 
+    # ── UI construction ─────────────────────────────────────────────────────
+    #
+    # Layout: sidebar (navigation + recent files) | page stack.
+    # Every command is in the menu bar; settings live in their own window;
+    # results are reported inline (banner), not with modal alerts.
+
+    PAGE_SEPARATE, PAGE_MIX = 0, 1
+
     def init_ui(self):
         """Initialize user interface."""
-        self.setWindowTitle("TrachSplitter - Audio Source Separation & Editing")
+        self.setWindowTitle("TrachSplitter")
         for icon_name in ("icon.ico", "icon.svg"):
             icon_path = Path(__file__).resolve().parent / icon_name
             if icon_path.exists():
                 self.setWindowIcon(QIcon(str(icon_path)))
                 break
-        # Responsive geometry: restore last session, else size to the screen
-        self.setMinimumSize(1024, 640)
+        self.setMinimumSize(1024, 680)
         saved_geo = self.config.get('window_geometry')
         screen = QApplication.primaryScreen().availableGeometry()
         if (isinstance(saved_geo, list) and len(saved_geo) == 4
-                and saved_geo[2] >= 1024 and saved_geo[3] >= 640
+                and saved_geo[2] >= 1024 and saved_geo[3] >= 680
                 and saved_geo[0] < screen.right() and saved_geo[1] < screen.bottom()):
             self.setGeometry(*saved_geo)
         else:
@@ -610,914 +655,944 @@ class TrachSplitterGUI(QMainWindow):
                 screen.y() + (screen.height() - h) // 2,
                 w, h
             )
-        self.setStyleSheet(self.get_stylesheet())
 
-        # Central widget — 8px grid: 16px page margin, 12px section spacing
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(16, 12, 16, 8)
-        main_layout.setSpacing(8)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_sidebar())
 
-        # Header: identity left, one-line purpose right (F-pattern scan start)
-        header = QHBoxLayout()
-        title = QLabel("TrachSplitter")
-        title.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
-        header.addWidget(title)
-        subtitle = QLabel("AI stem separation & mixing")
-        subtitle.setStyleSheet("color: #8fb8b8; font-size: 13px; padding-top: 6px;")
-        header.addWidget(subtitle)
-        header.addStretch()
-        main_layout.addLayout(header)
+        main_col = QWidget()
+        main_col.setObjectName("page")
+        col = QVBoxLayout(main_col)
+        col.setContentsMargins(20, 16, 20, 12)
+        col.setSpacing(10)
+        col.addWidget(self._build_banner())
 
-        # Create tab widget
-        tabs = QTabWidget()
-        self.tabs = tabs
+        self.tabs = QStackedWidget()
+        self.tabs.addWidget(self.create_separation_tab())
+        self.tabs.addWidget(self.create_editing_tab())
+        col.addWidget(self.tabs, 1)
+        root.addWidget(main_col, 1)
 
-        # Tab 1: Separation
-        separation_widget = self.create_separation_tab()
-        tabs.addTab(separation_widget, "Separation")
-
-        # Tab 2: Editing
-        editing_widget = self.create_editing_tab()
-        tabs.addTab(editing_widget, "Editing & Mixing")
-
-        # Tab 3: Settings
-        settings_widget = self.create_settings_tab()
-        tabs.addTab(settings_widget, "Settings")
-
-        # Tab 4: Info
-        info_widget = self.create_info_tab()
-        tabs.addTab(info_widget, "Device Info")
-
-        main_layout.addWidget(tabs)
-
-        # Status bar
+        self.settings_dialog = self._build_settings_dialog()
+        self.nav_list.setCurrentRow(self.PAGE_SEPARATE)
         self.statusBar().showMessage("Ready")
+        self.apply_theme()
+
+    # ── Theme ───────────────────────────────────────────────────────────────
+
+    def apply_theme(self):
+        """Apply the light or dark tokens that match the system appearance."""
+        self.dark = ui_theme.system_is_dark()
+        t = ui_theme.tokens(self.dark)
+        app = QApplication.instance()
+        ui_theme.apply_palette(app, t)
+        app.setStyleSheet(ui_theme.stylesheet(t))
+        self.spectrogram_view.set_theme(t)
+        # Stem colours have light/dark variants: refresh every identity mark
+        for i in range(self.stem_output_list.count()):
+            item = self.stem_output_list.item(i)
+            item.setIcon(ui_theme.dot_icon(ui_theme.stem_color(item.data(Qt.ItemDataRole.UserRole), self.dark)))
+        for stem, cb in self.stem_checkboxes.items():
+            cb.setIcon(ui_theme.dot_icon(ui_theme.stem_color(stem, self.dark)))
+        for stem, lbl in getattr(self, 'mixer_dots', {}).items():
+            lbl.setPixmap(ui_theme.dot_icon(ui_theme.stem_color(stem, self.dark)).pixmap(12, 12))
+
+    def changeEvent(self, event):
+        # Windows/macOS send PaletteChange/ThemeChange when the appearance flips
+        if event.type() in (QEvent.Type.ThemeChange, QEvent.Type.ApplicationPaletteChange):
+            if hasattr(self, 'spectrogram_view') and getattr(self, 'dark', None) is not None:
+                if ui_theme.system_is_dark() != self.dark:
+                    QTimer.singleShot(0, self.apply_theme)
+        super().changeEvent(event)
 
     def get_stylesheet(self) -> str:
-        """Application stylesheet.
+        """Current theme stylesheet (kept for API compatibility)."""
+        return ui_theme.stylesheet(ui_theme.tokens(getattr(self, 'dark', False)))
 
-        Layout constants follow common HCI guidance: 8px spacing grid,
-        >=32px interactive target height (Fitts's law), visible focus and
-        hover states, muted secondary text for hierarchy, and a single
-        accent hue so the primary action stands out.
-        """
-        return """
-        QMainWindow, QWidget {
-            background-color: #23272b;
-            color: #e8eef0;
-            font-size: 13px;
-        }
-        QLabel { color: #e8eef0; background: transparent; }
-        QLabel#hint { color: #8fb8b8; font-size: 12px; }
+    # ── Building blocks ─────────────────────────────────────────────────────
 
-        /* ── Buttons: 32px min target, clear hover/pressed/disabled/focus ── */
-        QPushButton {
-            background-color: #0d7377;
-            color: white;
-            border: none;
-            padding: 6px 14px;
-            min-height: 20px;
-            border-radius: 6px;
-            font-weight: 600;
-        }
-        QPushButton:hover { background-color: #14919b; }
-        QPushButton:pressed { background-color: #0a5463; }
-        QPushButton:focus { outline: none; border: 2px solid #7bdff2; padding: 4px 12px; }
-        QPushButton:disabled { background-color: #3a4045; color: #7a8288; }
+    @staticmethod
+    def _card(title: Optional[str] = None, caption: Optional[str] = None):
+        """Rounded content group; returns (frame, body layout)."""
+        frame = QFrame()
+        frame.setObjectName("card")
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        if title:
+            head = QLabel(title)
+            head.setObjectName("section")
+            lay.addWidget(head)
+        if caption:
+            cap = QLabel(caption)
+            cap.setObjectName("secondary")
+            cap.setWordWrap(True)
+            lay.addWidget(cap)
+        return frame, lay
 
-        QPushButton#primary_btn {
-            font-size: 15px;
-            padding: 10px 20px;
-            background-color: #0fa3a8;
-        }
-        QPushButton#primary_btn:hover { background-color: #17bfc5; }
-        QPushButton#primary_btn:pressed { background-color: #0a7276; }
+    @staticmethod
+    def _form_label(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("formLabel")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
 
-        QPushButton#secondary_btn {
-            background-color: #343b41;
-            color: #d7e5e5;
-        }
-        QPushButton#secondary_btn:hover { background-color: #40484f; }
+    @staticmethod
+    def _hline() -> QFrame:
+        line = QFrame()
+        line.setObjectName("hline")
+        return line
 
-        /* ── Inputs ── */
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-            background-color: #2c3237;
-            color: #e8eef0;
-            border: 1px solid #47505a;
-            padding: 5px 8px;
-            min-height: 20px;
-            border-radius: 5px;
-            selection-background-color: #0d7377;
-        }
-        QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #14919b; }
-        QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid #7bdff2; }
-        QComboBox::drop-down { border: none; width: 24px; }
-        QComboBox QAbstractItemView {
-            background-color: #2c3237;
-            color: #e8eef0;
-            selection-background-color: #0d7377;
-            border: 1px solid #47505a;
-        }
-        QCheckBox { spacing: 8px; min-height: 24px; background: transparent; }
-        QCheckBox::indicator { width: 18px; height: 18px; }
+    def _page_header(self, title: str, subtitle_attr: Optional[str] = None):
+        """Page title on the left, page actions on the right."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+        lbl = QLabel(title)
+        lbl.setObjectName("title")
+        text_col.addWidget(lbl)
+        if subtitle_attr:
+            sub = QLabel("")
+            sub.setObjectName("secondary")
+            setattr(self, subtitle_attr, sub)
+            text_col.addWidget(sub)
+        row.addLayout(text_col)
+        row.addStretch()
+        return row
 
-        /* ── Sliders: large grab handle ── */
-        QSlider { min-height: 28px; }
-        QSlider::groove:horizontal {
-            border: none;
-            height: 6px;
-            background: #3a4147;
-            margin: 2px 0;
-            border-radius: 3px;
-        }
-        QSlider::sub-page:horizontal { background: #0d7377; border-radius: 3px; }
-        QSlider::handle:horizontal {
-            background: #d7f3f1;
-            border: 2px solid #0d7377;
-            width: 16px;
-            height: 16px;
-            margin: -7px 0;
-            border-radius: 10px;
-        }
-        QSlider::handle:horizontal:hover { background: #7bdff2; }
+    # ── Sidebar ─────────────────────────────────────────────────────────────
 
-        QProgressBar {
-            border: none;
-            border-radius: 5px;
-            background-color: #2c3237;
-            color: white;
-            min-height: 18px;
-            text-align: center;
-        }
-        QProgressBar::chunk { background-color: #0fa3a8; border-radius: 5px; }
+    def _build_sidebar(self) -> QWidget:
+        side = QWidget()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(208)
+        lay = QVBoxLayout(side)
+        lay.setContentsMargins(0, 12, 0, 12)
+        lay.setSpacing(0)
 
-        /* ── Grouping: card-like sections (Gestalt proximity) ── */
-        QGroupBox {
-            color: #ffffff;
-            background-color: #282d32;
-            border: 1px solid #3a4147;
-            border-radius: 8px;
-            margin-top: 14px;
-            padding: 20px 12px 12px 12px;
-            font-weight: 600;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 12px;
-            top: 4px;
-            padding: 0 6px;
-            background-color: #23272b;
-            border-radius: 4px;
-            color: #9fd8d8;
-        }
-        QLabel#file_loaded { color: #7bdff2; font-weight: 600; font-size: 13px; }
-        QLabel#analysis_result { color: #d7f3f1; font-size: 13px; }
+        brand = QLabel("TrachSplitter")
+        brand.setObjectName("section")
+        brand.setContentsMargins(18, 0, 0, 8)
+        lay.addWidget(brand)
 
-        /* ── Tabs: roomy targets, clear selected state ── */
-        QTabWidget::pane { border: 1px solid #3a4147; border-radius: 6px; top: -1px; }
-        QTabBar::tab {
-            background-color: transparent;
-            color: #aeb8be;
-            padding: 9px 22px;
-            border: none;
-            border-bottom: 3px solid transparent;
-            font-weight: 600;
-        }
-        QTabBar::tab:hover { color: #e8eef0; }
-        QTabBar::tab:selected { color: #7bdff2; border-bottom: 3px solid #0fa3a8; }
+        self.nav_list = QListWidget()
+        self.nav_list.setObjectName("nav")
+        self.nav_list.setAccessibleName("Sections")
+        for text, tip in (("Separate", "Split a song into stems (Ctrl+1)"),
+                          ("Mix", "Balance stems, add effects and export (Ctrl+2)")):
+            item = QListWidgetItem(text)
+            item.setToolTip(tip)
+            self.nav_list.addItem(item)
+        self.nav_list.setFixedHeight(2 * 34 + 8)
+        self.nav_list.currentRowChanged.connect(self._on_nav_changed)
+        lay.addWidget(self.nav_list)
 
-        QListWidget {
-            background-color: #2c3237;
-            border: 1px solid #3a4147;
-            border-radius: 6px;
-            padding: 4px;
-        }
-        QListWidget::item { padding: 6px 8px; border-radius: 4px; min-height: 20px; }
-        QListWidget::item:hover { background-color: #343b41; }
-        QListWidget::item:selected { background-color: #0d7377; color: white; }
+        hdr = QLabel("RECENT")
+        hdr.setObjectName("sidebarHeader")
+        lay.addWidget(hdr)
+        self.recent_list = QListWidget()
+        self.recent_list.setObjectName("recent")
+        self.recent_list.setAccessibleName("Recent files")
+        self.recent_list.itemActivated.connect(self._on_recent_item)
+        self.recent_list.itemClicked.connect(self._on_recent_item)
+        lay.addWidget(self.recent_list, 1)
+        self._refresh_recent_combo()
+        return side
 
-        QScrollArea { border: none; background: transparent; }
-        QScrollBar:vertical { background: #23272b; width: 10px; border-radius: 5px; }
-        QScrollBar::handle:vertical { background: #47505a; border-radius: 5px; min-height: 30px; }
-        QScrollBar::handle:vertical:hover { background: #5a656f; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar:horizontal { background: #23272b; height: 10px; border-radius: 5px; }
-        QScrollBar::handle:horizontal { background: #47505a; border-radius: 5px; min-width: 30px; }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+    def _on_nav_changed(self, row: int):
+        if row >= 0:
+            self.tabs.setCurrentIndex(row)
 
-        QSplitter::handle { background-color: #3a4147; }
-        QSplitter::handle:horizontal { width: 5px; }
-        QSplitter::handle:hover { background-color: #0d7377; }
+    def show_page(self, index: int):
+        self.nav_list.setCurrentRow(index)
 
-        QStatusBar { color: #9fb8b8; }
-        QToolTip {
-            background-color: #16191c;
-            color: #d7f3f1;
-            border: 1px solid #0d7377;
-            padding: 6px 8px;
-            border-radius: 4px;
-        }
+    # ── Inline notifications ────────────────────────────────────────────────
 
-        /* ── Mixer mini-buttons ── */
-        QPushButton#mute_btn, QPushButton#solo_btn {
-            background-color: #343b41;
-            color: #aeb8be;
-            font-weight: bold;
-            font-size: 11px;
-            padding: 0;
-            border-radius: 5px;
-        }
-        QPushButton#mute_btn:checked { background-color: #cc3333; color: white; }
-        QPushButton#solo_btn:checked { background-color: #cc8800; color: white; }
+    def _build_banner(self) -> QFrame:
+        self.banner = QFrame()
+        self.banner.setObjectName("banner")
+        lay = QHBoxLayout(self.banner)
+        lay.setContentsMargins(12, 6, 6, 6)
+        lay.setSpacing(8)
+        self.banner_label = QLabel("")
+        self.banner_label.setWordWrap(True)
+        lay.addWidget(self.banner_label, 1)
+        self.banner_action = QPushButton("Show in Folder")
+        self.banner_action.setObjectName("link_btn")
+        self.banner_action.clicked.connect(self._banner_open)
+        lay.addWidget(self.banner_action)
+        close = QPushButton("Dismiss")
+        close.setObjectName("link_btn")
+        close.clicked.connect(self.banner.hide)
+        lay.addWidget(close)
+        self.banner.hide()
+        self._banner_path = None
+        self._banner_timer = QTimer(self)
+        self._banner_timer.setSingleShot(True)
+        self._banner_timer.timeout.connect(self.banner.hide)
+        return self.banner
 
-        QPushButton#preset_btn { background-color: #2a4a66; padding: 7px 12px; }
-        QPushButton#preset_btn:hover { background-color: #2f6a94; }
-        """
+    def notify(self, message: str, path: Optional[str] = None, timeout_ms: int = 10000):
+        """Non-modal result message with an optional 'Show in Folder' action."""
+        self.banner_label.setText(message)
+        self._banner_path = path
+        self.banner_action.setVisible(bool(path))
+        self.banner.show()
+        self.statusBar().showMessage(message, 8000)
+        self._banner_timer.start(timeout_ms)
+
+    def _banner_open(self):
+        if not self._banner_path:
+            return
+        target = self._banner_path
+        if os.path.isfile(target):
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(target)])
+                return
+            target = os.path.dirname(target)
+        self._open_path(target)
+
+    # ── Menu bar: every command lives here ──────────────────────────────────
+
+    def _init_shortcuts(self):
+        """Build the menu bar; menu shortcuts double as keyboard shortcuts."""
+        mb = self.menuBar()
+        mb.clear()
+
+        def act(menu, text, slot, shortcut=None, tip=None, role=None):
+            a = QAction(text, self)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            if tip:
+                a.setStatusTip(tip)
+            if role is not None:
+                a.setMenuRole(role)
+            a.triggered.connect(lambda checked=False: slot())
+            menu.addAction(a)
+            return a
+
+        m_file = mb.addMenu("&File")
+        act(m_file, "&Open…", self.browse_audio_file, "Ctrl+O", "Open an audio file")
+        self.recent_menu = m_file.addMenu("Open &Recent")
+        self._refresh_recent_menu()
+        act(m_file, "&Batch Separate…", lambda: self.start_batch(), "Ctrl+B",
+            "Separate many files and save each track's stems")
+        m_file.addSeparator()
+        act(m_file, "&Save All Stems…", self.save_stems, "Ctrl+Shift+S")
+        act(m_file, "&Export My Mix…", self.export_mix, "Ctrl+E",
+            "Save the mix as configured on the Mix page")
+        act(m_file, "Save (Mix or Stems)", self.save_current, "Ctrl+S")
+        m_file.addSeparator()
+        act(m_file, "Se&ttings…", self.open_settings, "Ctrl+,",
+            role=QAction.MenuRole.PreferencesRole)
+        m_file.addSeparator()
+        act(m_file, "E&xit", self.close, "Ctrl+Q", role=QAction.MenuRole.QuitRole)
+
+        m_track = mb.addMenu("&Track")
+        act(m_track, "&Separate", self.start_separation, "Ctrl+Return")
+        act(m_track, "&Cancel Separation", self.cancel_separation, "Escape")
+        m_track.addSeparator()
+        act(m_track, "&Analyze Tempo && Key", self.analyze_track, "Ctrl+I")
+        act(m_track, "Export &Click Track…", self.export_click_track)
+
+        m_play = mb.addMenu("&Playback")
+        act(m_play, "&Play / Stop", self.toggle_playback, "Space")
+        act(m_play, "Play Selected &Stem", self.play_selected_stem)
+        act(m_play, "Preview &Mix", self.preview_mix, "Ctrl+P")
+        act(m_play, "S&top", self.stop_playback, "Ctrl+.")
+
+        m_view = mb.addMenu("&View")
+        act(m_view, "&Separate", lambda: self.show_page(self.PAGE_SEPARATE), "Ctrl+1")
+        act(m_view, "&Mix", lambda: self.show_page(self.PAGE_MIX), "Ctrl+2")
+
+        m_help = mb.addMenu("&Help")
+        act(m_help, "&Keyboard Shortcuts", self.show_shortcuts, "F1")
+        act(m_help, "Show &Log Folder", lambda: self._open_path(str(Path.home() / '.trachsplitter')))
+        act(m_help, "&About TrachSplitter", self.show_about, role=QAction.MenuRole.AboutRole)
+
+    def show_shortcuts(self):
+        rows = [
+            ("Open file", "Ctrl+O"), ("Separate", "Ctrl+Enter"), ("Cancel", "Esc"),
+            ("Batch separate", "Ctrl+B"), ("Play / stop", "Space"), ("Preview mix", "Ctrl+P"),
+            ("Save mix (Mix page) or stems", "Ctrl+S"), ("Export my mix", "Ctrl+E"),
+            ("Save all stems", "Ctrl+Shift+S"), ("Analyze", "Ctrl+I"),
+            ("Separate / Mix page", "Ctrl+1 / Ctrl+2"), ("Settings", "Ctrl+,"),
+        ]
+        html = "<table cellspacing='6'>" + "".join(
+            f"<tr><td>{a}</td><td><b>{k}</b></td></tr>" for a, k in rows
+        ) + "</table>"
+        QMessageBox.information(self, "Keyboard Shortcuts", html)
+
+    def show_about(self):
+        dev = self.separator.device.upper() if self.separator else "not loaded"
+        QMessageBox.about(
+            self, "About TrachSplitter",
+            "<b>TrachSplitter</b><br>AI stem separation and mixing.<br><br>"
+            f"Separation by Meta's Demucs v4 · running on {dev}.<br>"
+            "Everything runs locally; your audio never leaves this computer."
+        )
+
+    # ── Separate page ───────────────────────────────────────────────────────
 
     def create_separation_tab(self) -> QWidget:
-        """Create separation tab.
+        """Separate page: source → options → separate (left), stems (right)."""
+        page = QWidget()
+        page.setObjectName("page")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
 
-        Master-detail layout: input workflow reads top-to-bottom in a
-        scrollable left column (F-pattern), results and the large
-        spectrogram get the remaining space on the right.
-        """
-        widget = QWidget()
-        outer = QHBoxLayout(widget)
-        outer.setContentsMargins(8, 8, 8, 8)
+        header = self._page_header("Separate")
+        self.batch_btn = QPushButton("Batch Separate…")
+        self.batch_btn.setToolTip(
+            "Pick many files (or drop several / a folder on the window).\n"
+            "Each track's stems are saved to its own folder. (Ctrl+B)"
+        )
+        self.batch_btn.clicked.connect(lambda: self.start_batch())
+        header.addWidget(self.batch_btn)
+        outer.addLayout(header)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(splitter)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(10)
+        outer.addWidget(splitter, 1)
 
-        # ── LEFT: input workflow ────────────────────────────────────────────
+        # ── Left column ─────────────────────────────────────────────────────
         left = QWidget()
+        left.setObjectName("page")
         layout = QVBoxLayout(left)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 12, 0)
+        layout.setSpacing(12)
 
-        # File selection — filename on its own line (never truncates the
-        # controls), pickers below
-        file_group = QGroupBox("Audio File")
-        file_layout = QVBoxLayout(file_group)
-        file_layout.setSpacing(8)
-        self.file_path_label = QLabel("No file selected — browse, pick a recent file, or drop one anywhere")
-        self.file_path_label.setObjectName("hint")
+        # Source: empty-state drop zone, or the loaded track
+        self.source_stack = QStackedWidget()
+        drop = QFrame()
+        drop.setObjectName("dropZone")
+        drop_lay = QVBoxLayout(drop)
+        drop_lay.setContentsMargins(20, 24, 20, 24)
+        drop_lay.setSpacing(8)
+        drop_title = QLabel("Drop a song here")
+        drop_title.setObjectName("section")
+        drop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        drop_lay.addWidget(drop_title)
+        drop_cap = QLabel("MP3, WAV, FLAC, OGG, M4A · drop a folder to batch")
+        drop_cap.setObjectName("secondary")
+        drop_cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        drop_lay.addWidget(drop_cap)
+        open_btn = QPushButton("Open…")
+        open_btn.setObjectName("primary_btn")
+        open_btn.setToolTip("Ctrl+O")
+        open_btn.clicked.connect(self.browse_audio_file)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(open_btn)
+        row.addStretch()
+        drop_lay.addLayout(row)
+        self.drop_zone = drop
+        self.source_stack.addWidget(drop)
+
+        track_card, track_lay = self._card()
+        self.file_path_label = QLabel("")
+        self.file_path_label.setObjectName("file_loaded")
         self.file_path_label.setWordWrap(True)
-        file_layout.addWidget(self.file_path_label)
-        file_row = QHBoxLayout()
-        file_row.setSpacing(8)
-        self.recent_combo = QComboBox()
-        self.recent_combo.setToolTip("Recently used files")
-        self.recent_combo.activated.connect(self.on_recent_selected)
-        self._refresh_recent_combo()
-        file_row.addWidget(self.recent_combo, 1)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self.browse_audio_file)
-        file_row.addWidget(browse_btn)
-        file_layout.addLayout(file_row)
-        layout.addWidget(file_group)
-
-        # Track analysis (BPM / key / loudness)
-        analysis_group = QGroupBox("Track Analysis")
-        analysis_layout = QVBoxLayout(analysis_group)
-        analysis_layout.setSpacing(8)
-        self.analysis_label = QLabel("BPM, key and loudness of the loaded file.")
-        self.analysis_label.setObjectName("hint")
+        track_lay.addWidget(self.file_path_label)
+        self.analysis_label = QLabel("Tempo, key and loudness: not analyzed yet")
+        self.analysis_label.setObjectName("analysis_result")
         self.analysis_label.setWordWrap(True)
-        analysis_layout.addWidget(self.analysis_label)
-        analysis_btns = QHBoxLayout()
-        analysis_btns.setSpacing(8)
-        self.analyze_btn = QPushButton("Analyze Track")
-        self.analyze_btn.setObjectName("secondary_btn")
+        track_lay.addWidget(self.analysis_label)
+        track_btns = QHBoxLayout()
+        track_btns.setSpacing(8)
+        self.analyze_btn = QPushButton("Analyze")
+        self.analyze_btn.setToolTip("Detect tempo, key and loudness (Ctrl+I)")
         self.analyze_btn.clicked.connect(self.analyze_track)
-        analysis_btns.addWidget(self.analyze_btn)
-        self.click_btn = QPushButton("Export Click Track…")
-        self.click_btn.setObjectName("secondary_btn")
-        self.click_btn.setToolTip("Metronome WAV aligned to the detected beats — great for practice")
+        track_btns.addWidget(self.analyze_btn)
+        self.click_btn = QPushButton("Click Track…")
+        self.click_btn.setToolTip("Save a metronome aligned to the detected beats")
         self.click_btn.setEnabled(False)
         self.click_btn.clicked.connect(self.export_click_track)
-        analysis_btns.addWidget(self.click_btn)
-        analysis_layout.addLayout(analysis_btns)
-        layout.addWidget(analysis_group)
+        track_btns.addWidget(self.click_btn)
+        track_btns.addStretch()
+        change_btn = QPushButton("Change…")
+        change_btn.clicked.connect(self.browse_audio_file)
+        track_btns.addWidget(change_btn)
+        track_lay.addLayout(track_btns)
+        self.source_stack.addWidget(track_card)
+        self.source_stack.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        layout.addWidget(self.source_stack)
 
-        # Model selection
-        model_group = QGroupBox("Model Configuration")
-        model_layout = QVBoxLayout(model_group)
+        # Options
+        opt_card, opt_lay = self._card("Options")
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setColumnStretch(1, 1)
 
-        model_layout.setSpacing(8)
+        form.addWidget(self._form_label("Model"), 0, 0)
         self.model_combo = QComboBox()
+        self.model_combo.setAccessibleName("Separation model")
         for group, model_ids in self.config.MODEL_GROUPS.items():
-            self.model_combo.addItem(f"—  {group}  —", userData=None)
+            self.model_combo.addItem(f"{group}", userData=None)
             idx = self.model_combo.count() - 1
             self.model_combo.model().item(idx).setEnabled(False)
             for model_id in model_ids:
                 short = self.config.MODEL_NOTES.get(model_id, model_id)
-                self.model_combo.addItem(f"{model_id}  ·  {short}", userData=model_id)
+                self.model_combo.addItem(f"   {model_id} — {short}", userData=model_id)
         self.model_combo.setToolTip(
-            "Best Quality = slower, cleanest stems\n"
-            "Balanced = good speed/quality trade-off\n"
-            "Fast / Light = quickest, lowest memory\n"
-            "htdemucs_6s adds guitar & piano stems"
+            "Best Quality: slower, cleanest stems\n"
+            "Balanced: good speed/quality trade-off\n"
+            "Fast / Light: quickest, lowest memory\n"
+            "htdemucs_6s adds guitar and piano"
         )
         self.model_combo.currentTextChanged.connect(self.on_model_changed)
         self.set_model_combo(self.config.get('model', 'htdemucs'))
-        model_layout.addWidget(self.model_combo)
-
+        form.addWidget(self.model_combo, 0, 1)
         self.model_info_label = QLabel("")
-        self.model_info_label.setObjectName("hint")
+        self.model_info_label.setObjectName("caption")
         self.model_info_label.setWordWrap(True)
-        model_layout.addWidget(self.model_info_label)
+        form.addWidget(self.model_info_label, 1, 1)
 
-        self.model_caps_label = QLabel("")
-        self.model_caps_label.setObjectName("hint")
-        self.model_caps_label.setWordWrap(True)
-        model_layout.addWidget(self.model_caps_label)
+        form.addWidget(self._form_label("Output"), 2, 0)
+        self.two_stems_combo = QComboBox()
+        self.two_stems_combo.setAccessibleName("Output mode")
+        self.two_stems_combo.addItem("All stems", userData=None)
+        self.two_stems_combo.setToolTip(
+            "All stems: one file per instrument.\n"
+            "'Vocals + everything else' gives an acapella and a karaoke backing track."
+        )
+        self.two_stems_combo.currentIndexChanged.connect(self._on_output_mode_changed)
+        form.addWidget(self.two_stems_combo, 2, 1)
 
-        # Advanced options — one labelled row, explained via tooltips
-        advanced_h = QHBoxLayout()
-        advanced_h.setSpacing(8)
-        adv_lbl = QLabel("Advanced:")
-        adv_lbl.setObjectName("hint")
-        advanced_h.addWidget(adv_lbl)
-        advanced_h.addWidget(QLabel("Segment"))
-        self.segment_spin = QSpinBox()
-        self.segment_spin.setMinimum(0)
-        self.segment_spin.setMaximum(60)
-        self.segment_spin.setValue(0)
-        self.segment_spin.setSpecialValueText("auto")
-        self.segment_spin.setSuffix(" s")
-        self.segment_spin.setToolTip("Chunk length for processing. auto = let the model decide; lower it if you run out of GPU memory.")
-        advanced_h.addWidget(self.segment_spin)
-        advanced_h.addWidget(QLabel("Shifts"))
-        self.shifts_spin = QSpinBox()
-        self.shifts_spin.setMinimum(1)
-        self.shifts_spin.setMaximum(10)
-        self.shifts_spin.setValue(1)
-        self.shifts_spin.setToolTip("Number of prediction passes. More = slightly better quality, proportionally slower.")
-        advanced_h.addWidget(self.shifts_spin)
-        advanced_h.addStretch()
-        model_layout.addLayout(advanced_h)
-
-        layout.addWidget(model_group)
-
-        # Stems selection
-        stems_group = QGroupBox("Output Stems")
-        stems_layout = QVBoxLayout(stems_group)
-        stems_layout.setSpacing(8)
-        stems_help = QLabel("Untick any stems you don't need.")
-        stems_help.setObjectName("hint")
-        stems_help.setWordWrap(True)
-        stems_help.setToolTip("Stems the selected model can't produce are hidden automatically.")
-        stems_layout.addWidget(stems_help)
+        self.stems_label = self._form_label("Stems")
+        self.stems_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        form.addWidget(self.stems_label, 3, 0)
+        self.stems_group = QWidget()
+        self.stems_layout = QGridLayout(self.stems_group)
+        self.stems_layout.setContentsMargins(0, 0, 0, 0)
+        self.stems_layout.setHorizontalSpacing(14)
+        self.stems_layout.setVerticalSpacing(4)
         self.stem_checkboxes = {}
-        stems_grid = QGridLayout()
-        stems_grid.setHorizontalSpacing(16)
-        stems_grid.setVerticalSpacing(4)
-        for i, stem in enumerate(['drums', 'bass', 'vocals', 'other', 'guitar', 'piano']):
+        for i, stem in enumerate(ALL_STEMS):
             checkbox = QCheckBox(stem.capitalize())
             checkbox.setChecked(stem in ['drums', 'bass', 'vocals', 'other'])
             self.stem_checkboxes[stem] = checkbox
-            stems_grid.addWidget(checkbox, i // 3, i % 3)
-        stems_layout.addLayout(stems_grid)
-        layout.addWidget(stems_group)
-        self.stems_group = stems_group
-        self.stems_layout = stems_layout
+            self.stems_layout.addWidget(checkbox, i // 3, i % 3)
+        form.addWidget(self.stems_group, 3, 1)
+        self.model_caps_label = QLabel("")
+        self.model_caps_label.hide()  # stem availability is shown by the checkboxes
+        self.two_stems_group = self.two_stems_combo
 
-        # Two stems mode
-        two_stems_group = QGroupBox("Karaoke Mode")
-        two_stems_layout = QHBoxLayout(two_stems_group)
-        two_stems_layout.setSpacing(8)
-        extract_lbl = QLabel("Extract only:")
-        two_stems_layout.addWidget(extract_lbl)
-        self.two_stems_combo = QComboBox()
-        self.two_stems_combo.addItem("Disabled")
-        self.two_stems_combo.addItems(['drums', 'bass', 'vocals', 'other', 'guitar', 'piano'])
-        self.two_stems_combo.setToolTip(
-            "Splits the track into just two outputs:\n"
-            "the chosen stem, and everything else mixed together.\n"
-            "Pick 'vocals' for a karaoke instrumental."
-        )
-        two_stems_layout.addWidget(self.two_stems_combo, 1)
-        layout.addWidget(two_stems_group)
-        self.two_stems_group = two_stems_group
+        # Advanced: progressive disclosure
+        self.advanced_btn = QPushButton("▸ Advanced")
+        self.advanced_btn.setObjectName("link_btn")
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.toggled.connect(self._toggle_advanced)
+        form.addWidget(self.advanced_btn, 4, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.advanced_box = QWidget()
+        adv = QHBoxLayout(self.advanced_box)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.setSpacing(8)
+        adv.addWidget(QLabel("Segment"))
+        self.segment_spin = QSpinBox()
+        self.segment_spin.setRange(0, 60)
+        self.segment_spin.setSpecialValueText("Auto")
+        self.segment_spin.setSuffix(" s")
+        self.segment_spin.setToolTip("Chunk length. Lower it if your GPU runs out of memory.")
+        adv.addWidget(self.segment_spin)
+        adv.addSpacing(8)
+        adv.addWidget(QLabel("Passes"))
+        self.shifts_spin = QSpinBox()
+        self.shifts_spin.setRange(1, 10)
+        self.shifts_spin.setToolTip("Prediction passes. More = slightly cleaner, proportionally slower.")
+        adv.addWidget(self.shifts_spin)
+        adv.addStretch()
+        self.advanced_box.hide()
+        form.addWidget(self.advanced_box, 5, 1)
+        opt_lay.addLayout(form)
 
-        # Primary action + progress: end of the input workflow, most
-        # prominent element in the column (visual hierarchy)
-        self.auto_save_check = QCheckBox("Auto-save stems to working folder")
-        self.auto_save_check.setToolTip(
-            "After each separation, write every stem to\n"
-            "<working directory>/<track name>/ in the chosen output format."
-        )
+        self.auto_save_check = QCheckBox("Save stems to the working folder automatically")
+        self.auto_save_check.setToolTip("Writes every stem to <working folder>/<track name>/")
         self.auto_save_check.setChecked(bool(self.config.get('auto_save_stems', False)))
         self.auto_save_check.toggled.connect(lambda v: self._save_setting('auto_save_stems', v))
-        layout.addWidget(self.auto_save_check)
+        opt_lay.addWidget(self.auto_save_check)
+        layout.addWidget(opt_card)
 
-        sep_row = QHBoxLayout()
-        sep_row.setSpacing(8)
-        self.separate_btn = QPushButton("Separate Audio")
+        # Primary action + progress
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+        self.separate_btn = QPushButton("Separate")
         self.separate_btn.setObjectName("primary_btn")
         self.separate_btn.setToolTip("Ctrl+Enter")
+        self.separate_btn.setMinimumHeight(34)
         self.separate_btn.clicked.connect(self.start_separation)
-        self.separate_btn.setMinimumHeight(46)
-        sep_row.addWidget(self.separate_btn, 3)
+        act_row.addWidget(self.separate_btn, 1)
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("secondary_btn")
-        self.cancel_btn.setToolTip("Stop the running separation (Esc)")
-        self.cancel_btn.setMinimumHeight(46)
+        self.cancel_btn.setToolTip("Esc")
+        self.cancel_btn.setMinimumHeight(34)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel_separation)
-        sep_row.addWidget(self.cancel_btn, 1)
-        layout.addLayout(sep_row)
-
-        self.batch_btn = QPushButton("Batch Separate Files…")
-        self.batch_btn.setObjectName("secondary_btn")
-        self.batch_btn.setToolTip(
-            "Pick many files (or drop several / a folder on the window).\n"
-            "Each track's stems are saved to <working directory>/<track name>/. (Ctrl+B)"
-        )
-        self.batch_btn.clicked.connect(lambda: self.start_batch())
-        layout.addWidget(self.batch_btn)
-
-        progress_group = QGroupBox("Progress")
-        progress_layout = QVBoxLayout(progress_group)
-        progress_layout.setSpacing(8)
-        self.progress_label = QLabel("Ready")
-        self.progress_label.setObjectName("hint")
-        self.progress_label.setWordWrap(True)
-        progress_layout.addWidget(self.progress_label)
+        act_row.addWidget(self.cancel_btn)
+        layout.addLayout(act_row)
         self.progress_bar = QProgressBar()
-        progress_layout.addWidget(self.progress_bar)
-        layout.addWidget(progress_group)
-
+        self.progress_bar.setAccessibleName("Separation progress")
+        layout.addWidget(self.progress_bar)
+        self.progress_label = QLabel("Ready")
+        self.progress_label.setObjectName("secondary")
+        self.progress_label.setWordWrap(True)
+        layout.addWidget(self.progress_label)
         layout.addStretch()
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setWidget(left)
         left_scroll.setMinimumWidth(360)
-        left_scroll.setMaximumWidth(520)
+        left_scroll.setMaximumWidth(480)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         splitter.addWidget(left_scroll)
 
-        # ── RIGHT: results ──────────────────────────────────────────────────
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 0, 0, 0)
-        right_layout.setSpacing(10)
+        # ── Right column: stems ─────────────────────────────────────────────
+        res_card, res_lay = self._card()
+        res_head = QHBoxLayout()
+        res_title = QLabel("Stems")
+        res_title.setObjectName("section")
+        res_head.addWidget(res_title)
+        res_head.addStretch()
+        self.save_all_btn = QPushButton("Save All Stems…")
+        self.save_all_btn.setToolTip("Write each stem as its own file (Ctrl+Shift+S)")
+        self.save_all_btn.clicked.connect(self.save_stems)
+        self._render_buttons.append(self.save_all_btn)
+        res_head.addWidget(self.save_all_btn)
+        res_lay.addLayout(res_head)
 
-        outputs_group = QGroupBox("Separated Outputs")
-        outputs_layout = QVBoxLayout(outputs_group)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        list_col = QVBoxLayout()
+        list_col.setSpacing(6)
         self.stem_output_list = QListWidget()
+        self.stem_output_list.setAccessibleName("Separated stems")
         self.stem_output_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.stem_output_list.setToolTip(
             "Ctrl/Shift-click to select several stems:\n"
-            "they play together and merge into one file on export."
+            "they play together and merge into one file."
         )
+        self.stem_output_list.setIconSize(QSize(12, 12))
+        self.stem_output_list.setFixedWidth(200)
         self.stem_output_list.itemSelectionChanged.connect(self.on_stem_selection_changed)
-        self.stem_output_list.setMaximumHeight(140)
-        self.stem_output_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        outputs_layout.addWidget(self.stem_output_list)
+        list_col.addWidget(self.stem_output_list, 1)
+        self.stems_empty_label = QLabel("Stems appear here after separating.")
+        self.stems_empty_label.setObjectName("caption")
+        self.stems_empty_label.setWordWrap(True)
+        self.stems_empty_label.setFixedWidth(200)
+        list_col.addWidget(self.stems_empty_label)
+        body.addLayout(list_col)
 
+        viewer_col = QVBoxLayout()
+        viewer_col.setSpacing(8)
         self.spectrogram_view = AudioViewer()
         self.spectrogram_view.set_on_select(self.on_spectrogram_selection)
         self.spectrogram_view.set_on_seek(self.seek_playback)
-        self.spectrogram_view.setMinimumHeight(280)
-        self.spectrogram_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        outputs_layout.addWidget(self.spectrogram_view, 1)
+        self.spectrogram_view.setMinimumHeight(260)
+        viewer_col.addWidget(self.spectrogram_view, 1)
 
-        stem_actions = QHBoxLayout()
-        stem_actions.setSpacing(8)
-        play_stem_btn = QPushButton("▶  Play Stem")
-        play_stem_btn.setToolTip("Play the selected stem inside the app. Click the waveform to seek.")
+        transport = QHBoxLayout()
+        transport.setSpacing(8)
+        play_stem_btn = QPushButton("▶  Play")
+        play_stem_btn.setToolTip("Play the selected stem(s). Click the waveform to seek. (Space)")
         play_stem_btn.clicked.connect(self.play_selected_stem)
-        stem_actions.addWidget(play_stem_btn)
-
+        transport.addWidget(play_stem_btn)
         stop_stem_btn = QPushButton("■  Stop")
         stop_stem_btn.clicked.connect(self.stop_playback)
-        stop_stem_btn.setObjectName("secondary_btn")
-        stem_actions.addWidget(stop_stem_btn)
-
-        stem_actions.addStretch()
-
+        transport.addWidget(stop_stem_btn)
+        transport.addStretch()
         export_sel_btn = QPushButton("Export Selection…")
-        export_sel_btn.setToolTip("Export the region drag-selected on the spectrogram")
+        export_sel_btn.setToolTip("Save the region dragged on the spectrogram")
         export_sel_btn.clicked.connect(self.export_selection)
         self._render_buttons.append(export_sel_btn)
-        stem_actions.addWidget(export_sel_btn)
+        transport.addWidget(export_sel_btn)
+        open_btn2 = QPushButton("Open in Player")
+        open_btn2.setToolTip("Open the stem in your default audio player")
+        open_btn2.clicked.connect(self.open_stem_in_player)
+        transport.addWidget(open_btn2)
+        viewer_col.addLayout(transport)
+        body.addLayout(viewer_col, 1)
+        res_lay.addLayout(body, 1)
 
-        open_btn = QPushButton("Open in Music Player")
-        open_btn.setObjectName("secondary_btn")
-        open_btn.setToolTip("Opens the stem in your system's default audio player")
-        open_btn.clicked.connect(self.open_stem_in_player)
-        stem_actions.addWidget(open_btn)
-        outputs_layout.addLayout(stem_actions)
-        right_layout.addWidget(outputs_group, 1)
-
-        # Export shortcuts for the results (grouped with what they act on)
+        res_lay.addWidget(self._hline())
         export_row = QHBoxLayout()
         export_row.setSpacing(8)
-        export_row.addWidget(QLabel("Quick Export:"))
+        export_row.addWidget(self._form_label("Quick export"))
         self.quick_preset_combo = QComboBox()
+        self.quick_preset_combo.setAccessibleName("Quick export preset")
         self.quick_preset_combo.addItems(list(MIX_PRESETS.keys()))
         self.quick_preset_combo.setToolTip(
-            "Full Mix = all stems\n"
-            "Instrumental = no vocals (karaoke / backing track)\n"
-            "Vocals Only = acapella\n"
-            "Drums + Bass = rhythm section\n"
+            "Exports straight from the raw stems (ignores the Mix page).\n"
+            "Instrumental = no vocals · Vocals Only = acapella ·\n"
             "Drumless / Bassless = play-along tracks"
         )
-        export_row.addWidget(self.quick_preset_combo, 1)
-        quick_export_btn = QPushButton("Export Mix")
+        export_row.addWidget(self.quick_preset_combo)
+        quick_export_btn = QPushButton("Export Preset…")
         quick_export_btn.clicked.connect(self.quick_export_mix)
         self._render_buttons.append(quick_export_btn)
         export_row.addWidget(quick_export_btn)
-
+        export_row.addStretch()
         merge_btn = QPushButton("Merge Selected…")
-        merge_btn.setToolTip(
-            "Merge the stems selected in the list above into a single audio file"
-        )
+        merge_btn.setToolTip("Mix the stems selected in the list into one file")
         merge_btn.clicked.connect(self.export_merged_selection)
         self._render_buttons.append(merge_btn)
         export_row.addWidget(merge_btn)
+        res_lay.addLayout(export_row)
 
-        save_btn = QPushButton("Save Individual Stems")
-        save_btn.clicked.connect(self.save_stems)
-        self._render_buttons.append(save_btn)
-        export_row.addWidget(save_btn)
-        right_layout.addLayout(export_row)
-
-        splitter.addWidget(right)
+        splitter.addWidget(res_card)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 900])
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
+        splitter.setSizes([400, 900])
 
-        # Populate model info / stem availability for the initial selection
         self.sync_stem_controls()
-        return widget
+        return page
+
+    def _toggle_advanced(self, shown: bool):
+        self.advanced_box.setVisible(shown)
+        self.advanced_btn.setText("▾ Advanced" if shown else "▸ Advanced")
+
+    def _on_output_mode_changed(self, _index: int = 0):
+        two = self.two_stems_combo.currentData() is not None
+        self.stems_group.setVisible(not two)
+        self.stems_label.setVisible(not two)
+
+    # ── Mix page ────────────────────────────────────────────────────────────
 
     def create_editing_tab(self) -> QWidget:
-        """Create editing and mixing tab.
+        """Mix page: channel rows left, processing inspector right,
+        transport + export in the page header (never in a bottom bar)."""
+        page = QWidget()
+        page.setObjectName("page")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
 
-        Two-pane layout: the mixer (used constantly) gets the wide left
-        pane; effects and EQ (set-and-forget) sit right. Transport actions
-        live in a persistent bottom bar so they never scroll out of reach.
-        """
-        widget = QWidget()
-        outer = QVBoxLayout(widget)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(10)
+        header = self._page_header("Mix", subtitle_attr="mix_subtitle")
+        self.mix_subtitle.setText("Separate a track first, then balance its stems here.")
+        play_mix_btn = QPushButton("▶  Preview")
+        play_mix_btn.setToolTip("Render and play the mix as configured (Ctrl+P / Space)")
+        play_mix_btn.clicked.connect(self.preview_mix)
+        self._render_buttons.append(play_mix_btn)
+        header.addWidget(play_mix_btn)
+        stop_mix_btn = QPushButton("■  Stop")
+        stop_mix_btn.clicked.connect(self.stop_preview)
+        header.addWidget(stop_mix_btn)
+        export_btn = QPushButton("Export My Mix…")
+        export_btn.setObjectName("primary_btn")
+        export_btn.setToolTip(
+            "Save the mix exactly as configured: volumes, mute/solo, pan,\n"
+            "EQ, effects, pitch/speed and loudness (Ctrl+E)"
+        )
+        export_btn.clicked.connect(self.export_mix)
+        self._render_buttons.append(export_btn)
+        header.addWidget(export_btn)
+        outer.addLayout(header)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(10)
         outer.addWidget(splitter, 1)
 
-        # ── LEFT: mixer + presets ───────────────────────────────────────────
+        # ── Mixer ───────────────────────────────────────────────────────────
         left = QWidget()
+        left.setObjectName("page")
         layout = QVBoxLayout(left)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 12, 0)
+        layout.setSpacing(12)
 
-        # ── Stem Mixer ──────────────────────────────────────────────────────
-        mixer_group = QGroupBox("Stem Mixer")
-        mixer_layout = QVBoxLayout(mixer_group)
-
-        header = QHBoxLayout()
-        for text, stretch in [("Stem", 2), ("M", 0), ("S", 0), ("Volume", 5), ("Level", 1), ("Pan", 2)]:
+        mixer_card, mixer_lay = self._card("Stems")
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        for text, width, stretch in (("", 12, 0), ("Stem", 0, 2), ("Mute", 28, 0), ("Solo", 28, 0),
+                                     ("Volume", 0, 5), ("", 52, 0), ("Pan", 0, 2)):
             lbl = QLabel(text)
-            lbl.setStyleSheet("color: #b8d8d8; font-size: 11px;")
-            if stretch:
-                header.addWidget(lbl, stretch)
-            else:
-                lbl.setFixedWidth(32)
+            lbl.setObjectName("caption")
+            if width:
+                lbl.setFixedWidth(width)
                 lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                header.addWidget(lbl)
-        mixer_layout.addLayout(header)
-
-        # Rows are built from the actual separation result (4, 6 or
-        # karaoke stems) — see rebuild_mixer
+                head.addWidget(lbl)
+            else:
+                head.addWidget(lbl, stretch)
+        mixer_lay.addLayout(head)
         self.mixer_rows_layout = QVBoxLayout()
-        self.mixer_rows_layout.setSpacing(2)
-        mixer_layout.addLayout(self.mixer_rows_layout)
-        self.mixer_empty_label = QLabel("Separate a track to mix its stems here.")
-        self.mixer_empty_label.setObjectName("hint")
-        mixer_layout.addWidget(self.mixer_empty_label)
+        self.mixer_rows_layout.setSpacing(4)
+        mixer_lay.addLayout(self.mixer_rows_layout)
+        self.mixer_empty_label = QLabel("No stems yet. Separate a track on the Separate page.")
+        self.mixer_empty_label.setObjectName("secondary")
+        mixer_lay.addWidget(self.mixer_empty_label)
+        layout.addWidget(mixer_card)
 
-        layout.addWidget(mixer_group)
-
-        # ── Quick Presets ────────────────────────────────────────────────────
-        presets_group = QGroupBox("Quick Presets")
-        presets_layout = QGridLayout(presets_group)
-        presets_layout.setHorizontalSpacing(8)
-        presets_layout.setVerticalSpacing(8)
+        presets_card, presets_lay = self._card(
+            "Presets", "Resets volumes and pans, then mutes stems to match."
+        )
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
         for i, name in enumerate(MIX_PRESETS):
             btn = QPushButton(name)
             btn.setObjectName("preset_btn")
             btn.clicked.connect(lambda checked, n=name: self.apply_preset(n))
-            presets_layout.addWidget(btn, i // 3, i % 3)
-        layout.addWidget(presets_group)
+            grid.addWidget(btn, i // 4, i % 4)
+        presets_lay.addLayout(grid)
+        layout.addWidget(presets_card)
         layout.addStretch()
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setWidget(left)
-        left_scroll.setMinimumWidth(460)
+        left_scroll.setMinimumWidth(480)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         splitter.addWidget(left_scroll)
 
-        # ── RIGHT: effects + EQ ─────────────────────────────────────────────
+        # ── Inspector: processing in signal-flow order ──────────────────────
         right = QWidget()
+        right.setObjectName("page")
         layout = QVBoxLayout(right)
-        layout.setContentsMargins(8, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(12)
 
-        # ── Effects ──────────────────────────────────────────────────────────
-        effects_group = QGroupBox("Effects")
-        effects_layout = QVBoxLayout(effects_group)
+        eq_card, eq_lay = self._card("Tone")
+        eq_grid = QGridLayout()
+        eq_grid.setHorizontalSpacing(10)
+        eq_grid.setVerticalSpacing(4)
+        eq_grid.setColumnStretch(1, 1)
+        self.eq_sliders = {}
+        names = {80: "Low · 80 Hz", 250: "250 Hz", 1000: "1 kHz", 4000: "4 kHz", 12000: "High · 12 kHz"}
+        for r, freq in enumerate([80, 250, 1000, 4000, 12000]):
+            eq_grid.addWidget(self._form_label(names[freq]), r, 0)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-12, 12)
+            slider.setAccessibleName(f"EQ {names[freq]}")
+            self.eq_sliders[freq] = slider
+            eq_grid.addWidget(slider, r, 1)
+            val = QLabel("0 dB")
+            val.setObjectName("secondary")
+            val.setFixedWidth(44)
+            slider.valueChanged.connect(lambda v, lbl=val: lbl.setText(f"{v:+d} dB" if v else "0 dB"))
+            eq_grid.addWidget(val, r, 2)
+        eq_lay.addLayout(eq_grid)
+        layout.addWidget(eq_card)
 
-        comp_h = QHBoxLayout()
+        fx_card, fx_lay = self._card("Dynamics & Space")
+        fx = QGridLayout()
+        fx.setHorizontalSpacing(10)
+        fx.setVerticalSpacing(8)
+        fx.setColumnStretch(2, 1)
         self.compression_check = QCheckBox("Compression")
-        comp_h.addWidget(self.compression_check)
-        comp_h.addWidget(QLabel("Ratio:"))
+        fx.addWidget(self.compression_check, 0, 0)
+        fx.addWidget(self._form_label("Ratio"), 0, 1)
         self.compression_ratio = QDoubleSpinBox()
+        self.compression_ratio.setRange(1.0, 20.0)
         self.compression_ratio.setValue(4.0)
-        self.compression_ratio.setMinimum(1.0)
-        self.compression_ratio.setMaximum(20.0)
-        comp_h.addWidget(self.compression_ratio)
-        comp_h.addStretch()
-        effects_layout.addLayout(comp_h)
-
-        reverb_h = QHBoxLayout()
+        self.compression_ratio.setSuffix(" : 1")
+        fx.addWidget(self.compression_ratio, 0, 2)
         self.reverb_check = QCheckBox("Reverb")
-        reverb_h.addWidget(self.reverb_check)
-        reverb_h.addWidget(QLabel("Room Size:"))
+        fx.addWidget(self.reverb_check, 1, 0)
+        fx.addWidget(self._form_label("Room"), 1, 1)
         self.reverb_size = QDoubleSpinBox()
-        self.reverb_size.setValue(0.5)
-        self.reverb_size.setMinimum(0.0)
-        self.reverb_size.setMaximum(1.0)
+        self.reverb_size.setRange(0.0, 1.0)
         self.reverb_size.setSingleStep(0.1)
-        reverb_h.addWidget(self.reverb_size)
-        reverb_h.addStretch()
-        effects_layout.addLayout(reverb_h)
-
-        denoise_h = QHBoxLayout()
-        self.denoise_check = QCheckBox("De-noise (spectral gate)")
-        self.denoise_check.setToolTip("Reduce hiss/bleed left over from separation")
-        denoise_h.addWidget(self.denoise_check)
-        denoise_h.addWidget(QLabel("Strength:"))
+        self.reverb_size.setValue(0.5)
+        fx.addWidget(self.reverb_size, 1, 2)
+        self.denoise_check = QCheckBox("De-noise")
+        self.denoise_check.setToolTip("Reduce hiss and bleed left over from separation")
+        fx.addWidget(self.denoise_check, 2, 0)
+        fx.addWidget(self._form_label("Strength"), 2, 1)
         self.denoise_strength = QDoubleSpinBox()
-        self.denoise_strength.setMinimum(0.1)
-        self.denoise_strength.setMaximum(1.0)
+        self.denoise_strength.setRange(0.1, 1.0)
         self.denoise_strength.setSingleStep(0.1)
         self.denoise_strength.setValue(0.5)
-        denoise_h.addWidget(self.denoise_strength)
-        denoise_h.addStretch()
-        effects_layout.addLayout(denoise_h)
+        fx.addWidget(self.denoise_strength, 2, 2)
+        fx_lay.addLayout(fx)
+        layout.addWidget(fx_card)
 
-        fade_h = QHBoxLayout()
-        fade_h.addWidget(QLabel("Fade In (ms):"))
-        self.fade_in_spin = QSpinBox()
-        self.fade_in_spin.setMaximum(10000)
-        self.fade_in_spin.setSingleStep(100)
-        fade_h.addWidget(self.fade_in_spin)
-        fade_h.addWidget(QLabel("Fade Out (ms):"))
-        self.fade_out_spin = QSpinBox()
-        self.fade_out_spin.setMaximum(10000)
-        self.fade_out_spin.setSingleStep(100)
-        fade_h.addWidget(self.fade_out_spin)
-        fade_h.addStretch()
-        effects_layout.addLayout(fade_h)
-
-        norm_h = QHBoxLayout()
-        norm_h.addWidget(QLabel("Normalize:"))
-        self.normalize_mode = QComboBox()
-        self.normalize_mode.addItems(["Off", "Peak", "Loudness (LUFS)"])
-        self.normalize_mode.setToolTip(
-            "Peak = loudest sample hits the target (dBFS)\n"
-            "Loudness = match perceived loudness (LUFS) with a peak limiter.\n"
-            "-14 LUFS: Spotify/YouTube · -16: Apple Music · -23: broadcast"
-        )
-        norm_h.addWidget(self.normalize_mode)
-        self.normalize_target = QDoubleSpinBox()
-        self.normalize_target.setRange(-30.0, 0.0)
-        self.normalize_target.setSingleStep(0.5)
-        self.normalize_target.setValue(-1.0)
-        self.normalize_target.setSuffix(" dB")
-        self.normalize_target.setEnabled(False)
-        norm_h.addWidget(self.normalize_target)
-        self.normalize_mode.currentIndexChanged.connect(self._on_normalize_mode)
-        norm_h.addStretch()
-        effects_layout.addLayout(norm_h)
-
-        layout.addWidget(effects_group)
-
-        # ── Practice tools: key / speed ─────────────────────────────────────
-        practice_group = QGroupBox("Pitch && Tempo")
-        practice_layout = QHBoxLayout(practice_group)
-        practice_layout.addWidget(QLabel("Key:"))
+        pt_card, pt_lay = self._card("Pitch & Speed", "Practice tools: change key or tempo independently.")
+        pt = QHBoxLayout()
+        pt.setSpacing(8)
+        pt.addWidget(self._form_label("Key"))
         self.pitch_spin = QDoubleSpinBox()
         self.pitch_spin.setRange(-12.0, 12.0)
         self.pitch_spin.setSingleStep(1.0)
         self.pitch_spin.setDecimals(1)
         self.pitch_spin.setSuffix(" st")
         self.pitch_spin.setToolTip("Transpose in semitones without changing speed")
-        practice_layout.addWidget(self.pitch_spin)
-        practice_layout.addWidget(QLabel("Speed:"))
+        pt.addWidget(self.pitch_spin)
+        pt.addWidget(self._form_label("Speed"))
         self.tempo_spin = QSpinBox()
         self.tempo_spin.setRange(25, 200)
         self.tempo_spin.setSingleStep(5)
         self.tempo_spin.setValue(100)
         self.tempo_spin.setSuffix(" %")
-        self.tempo_spin.setToolTip("Slow down / speed up without changing pitch")
-        practice_layout.addWidget(self.tempo_spin)
+        self.tempo_spin.setToolTip("Slow down or speed up without changing pitch")
+        pt.addWidget(self.tempo_spin)
         reset_pt = QPushButton("Reset")
-        reset_pt.setObjectName("secondary_btn")
         reset_pt.clicked.connect(lambda: (self.pitch_spin.setValue(0), self.tempo_spin.setValue(100)))
-        practice_layout.addWidget(reset_pt)
-        practice_layout.addStretch()
-        layout.addWidget(practice_group)
+        pt.addWidget(reset_pt)
+        pt.addStretch()
+        pt_lay.addLayout(pt)
+        layout.addWidget(pt_card)
 
-        # ── 5-Band EQ ────────────────────────────────────────────────────────
-        eq_group = QGroupBox("5-Band EQ")
-        eq_layout = QVBoxLayout(eq_group)
-        self.eq_sliders = {}
-        for freq in [80, 250, 1000, 4000, 12000]:
-            eq_h = QHBoxLayout()
-            lbl = QLabel(f"{freq} Hz:")
-            lbl.setMinimumWidth(70)
-            eq_h.addWidget(lbl)
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setMinimum(-12)
-            slider.setMaximum(12)
-            slider.setValue(0)
-            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-            self.eq_sliders[freq] = slider
-            eq_h.addWidget(slider)
-            eq_val = QLabel("  0 dB")
-            eq_val.setMinimumWidth(50)
-            slider.valueChanged.connect(lambda v, lbl=eq_val: lbl.setText(f"{v:+d} dB"))
-            eq_h.addWidget(eq_val)
-            eq_layout.addLayout(eq_h)
-        layout.addWidget(eq_group)
+        out_card, out_lay = self._card("Output")
+        og = QGridLayout()
+        og.setHorizontalSpacing(10)
+        og.setVerticalSpacing(8)
+        og.setColumnStretch(3, 1)
+        og.addWidget(self._form_label("Fade in"), 0, 0)
+        self.fade_in_spin = QSpinBox()
+        self.fade_in_spin.setRange(0, 10000)
+        self.fade_in_spin.setSingleStep(100)
+        self.fade_in_spin.setSuffix(" ms")
+        og.addWidget(self.fade_in_spin, 0, 1)
+        og.addWidget(self._form_label("Fade out"), 0, 2)
+        self.fade_out_spin = QSpinBox()
+        self.fade_out_spin.setRange(0, 10000)
+        self.fade_out_spin.setSingleStep(100)
+        self.fade_out_spin.setSuffix(" ms")
+        og.addWidget(self.fade_out_spin, 0, 3, alignment=Qt.AlignmentFlag.AlignLeft)
+        og.addWidget(self._form_label("Loudness"), 1, 0)
+        self.normalize_mode = QComboBox()
+        self.normalize_mode.addItems(["Off", "Peak", "Loudness (LUFS)"])
+        self.normalize_mode.setToolTip(
+            "Peak: loudest sample hits the target (dBFS)\n"
+            "Loudness: match perceived loudness with a peak limiter.\n"
+            "-14 LUFS Spotify/YouTube · -16 Apple Music · -23 broadcast"
+        )
+        og.addWidget(self.normalize_mode, 1, 1)
+        og.addWidget(self._form_label("Target"), 1, 2)
+        self.normalize_target = QDoubleSpinBox()
+        self.normalize_target.setRange(-30.0, 0.0)
+        self.normalize_target.setSingleStep(0.5)
+        self.normalize_target.setValue(-1.0)
+        self.normalize_target.setSuffix(" dB")
+        self.normalize_target.setEnabled(False)
+        self.normalize_mode.currentIndexChanged.connect(self._on_normalize_mode)
+        og.addWidget(self.normalize_target, 1, 3, alignment=Qt.AlignmentFlag.AlignLeft)
+        out_lay.addLayout(og)
+        layout.addWidget(out_card)
         layout.addStretch()
 
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
         right_scroll.setWidget(right)
-        right_scroll.setMinimumWidth(320)
+        right_scroll.setMinimumWidth(340)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         splitter.addWidget(right_scroll)
-
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([760, 480])
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
+        splitter.setSizes([700, 460])
+        return page
 
-        # ── Persistent transport bar (never scrolls away) ───────────────────
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-        play_mix_btn = QPushButton("▶  Preview Mix")
-        play_mix_btn.setObjectName("primary_btn")
-        play_mix_btn.setMinimumHeight(40)
-        play_mix_btn.clicked.connect(self.preview_mix)
-        self._render_buttons.append(play_mix_btn)
-        action_row.addWidget(play_mix_btn, 2)
+    # ── Settings window ─────────────────────────────────────────────────────
 
-        stop_mix_btn = QPushButton("■  Stop")
-        stop_mix_btn.setObjectName("secondary_btn")
-        stop_mix_btn.setMinimumHeight(40)
-        stop_mix_btn.clicked.connect(self.stop_preview)
-        action_row.addWidget(stop_mix_btn, 1)
+    def _build_settings_dialog(self) -> QDialog:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setMinimumWidth(520)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 16)
+        tabs = QTabWidget()
+        tabs.addTab(self.create_settings_tab(), "General")
+        tabs.addTab(self.create_info_tab(), "Processing Info")
+        lay.addWidget(tabs)
+        buttons = QHBoxLayout()
+        reset_btn = QPushButton("Reset to Defaults…")
+        reset_btn.setObjectName("danger_btn")
+        reset_btn.clicked.connect(self.reset_settings)
+        buttons.addWidget(reset_btn)
+        buttons.addStretch()
+        done = QPushButton("Done")
+        done.setObjectName("primary_btn")
+        done.setDefault(True)
+        done.clicked.connect(dlg.accept)
+        buttons.addWidget(done)
+        lay.addLayout(buttons)
+        return dlg
 
-        export_btn = QPushButton("Export Mix…")
-        export_btn.setMinimumHeight(40)
-        export_btn.clicked.connect(self.export_mix)
-        self._render_buttons.append(export_btn)
-        action_row.addWidget(export_btn, 2)
-        outer.addLayout(action_row)
-
-        return widget
+    def open_settings(self):
+        self.update_info()
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
 
     def create_settings_tab(self) -> QWidget:
-        """Create settings tab (single readable column, ~640px measure)."""
-        outer_widget = QWidget()
-        outer_h = QHBoxLayout(outer_widget)
+        """General settings: processing device, file format, folder."""
         widget = QWidget()
-        widget.setMaximumWidth(680)
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 12, 8, 8)
-        layout.setSpacing(12)
-        outer_h.addWidget(widget)
-        outer_h.addStretch()
+        form = QGridLayout(widget)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setColumnStretch(1, 1)
 
-        # Device
-        device_group = QGroupBox("Device")
-        device_layout = QVBoxLayout(device_group)
-
-        device_h = QHBoxLayout()
-        device_h.addWidget(QLabel("Processing Device:"))
+        form.addWidget(self._form_label("Processor"), 0, 0)
         self.device_combo = QComboBox()
         self.device_combo.addItems(['cuda', 'mps', 'cpu'])
         self.device_combo.setCurrentText(self.config.get('device') or 'cpu')
         self.device_combo.currentTextChanged.connect(self.on_device_changed)
-        device_h.addWidget(self.device_combo)
-        device_layout.addLayout(device_h)
-        device_note = QLabel("cuda = NVIDIA GPU · mps = Apple Silicon · cpu = works everywhere (slow). "
-                             "Changing it reloads the model.")
-        device_note.setWordWrap(True)
-        device_note.setStyleSheet("color: #b8d8d8; font-size: 12px;")
-        device_layout.addWidget(device_note)
-        layout.addWidget(device_group)
+        form.addWidget(self.device_combo, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        note = QLabel("cuda: NVIDIA GPU · mps: Apple Silicon · cpu: works everywhere, slowest. "
+                      "Changing it reloads the model.")
+        note.setObjectName("caption")
+        note.setWordWrap(True)
+        form.addWidget(note, 1, 1)
 
-        # Output format
-        format_group = QGroupBox("Output Format")
-        format_layout = QVBoxLayout(format_group)
-
-        format_h = QHBoxLayout()
-        format_h.addWidget(QLabel("Format:"))
+        form.addWidget(self._form_label("File format"), 2, 0)
+        fmt_row = QHBoxLayout()
+        fmt_row.setSpacing(8)
         self.format_combo = QComboBox()
         self.format_combo.addItems(['wav', 'mp3', 'flac', 'ogg'])
         self.format_combo.setCurrentText(self.config.get('output_format', 'wav'))
-        self.format_combo.currentTextChanged.connect(
-            lambda v: self._save_setting('output_format', v)
-        )
-        format_h.addWidget(self.format_combo)
-
-        format_h.addWidget(QLabel("MP3 Bitrate:"))
+        self.format_combo.currentTextChanged.connect(lambda v: self._save_setting('output_format', v))
+        fmt_row.addWidget(self.format_combo)
+        fmt_row.addWidget(QLabel("MP3 bitrate"))
         self.bitrate_spin = QSpinBox()
-        self.bitrate_spin.setMinimum(128)
-        self.bitrate_spin.setMaximum(320)
+        self.bitrate_spin.setRange(128, 320)
+        self.bitrate_spin.setSingleStep(32)
+        self.bitrate_spin.setSuffix(" kbps")
         self.bitrate_spin.setValue(int(self.config.get('output_bitrate', 320)))
-        self.bitrate_spin.valueChanged.connect(
-            lambda v: self._save_setting('output_bitrate', v)
-        )
-        format_h.addWidget(self.bitrate_spin)
-        format_layout.addLayout(format_h)
-
-        self.float32_check = QCheckBox("Float32 (WAV only)")
+        self.bitrate_spin.valueChanged.connect(lambda v: self._save_setting('output_bitrate', v))
+        fmt_row.addWidget(self.bitrate_spin)
+        fmt_row.addStretch()
+        form.addLayout(fmt_row, 2, 1)
+        self.float32_check = QCheckBox("32-bit float WAV (for further editing in a DAW)")
         self.float32_check.setChecked(bool(self.config.get('float32', False)))
-        self.float32_check.toggled.connect(
-            lambda v: self._save_setting('float32', v)
-        )
-        format_layout.addWidget(self.float32_check)
+        self.float32_check.toggled.connect(lambda v: self._save_setting('float32', v))
+        form.addWidget(self.float32_check, 3, 1)
 
-        layout.addWidget(format_group)
-
-        # Working directory
-        dir_group = QGroupBox("Working Directory")
-        dir_layout = QHBoxLayout(dir_group)
+        form.addWidget(self._form_label("Working folder"), 4, 0)
+        dir_row = QHBoxLayout()
+        dir_row.setSpacing(8)
         self.dir_label = QLabel(self.working_directory)
-        dir_layout.addWidget(self.dir_label)
-        dir_btn = QPushButton("Change")
+        self.dir_label.setObjectName("secondary")
+        self.dir_label.setWordWrap(True)
+        self.dir_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        dir_row.addWidget(self.dir_label, 1)
+        dir_btn = QPushButton("Change…")
         dir_btn.clicked.connect(self.change_directory)
-        dir_layout.addWidget(dir_btn)
-        layout.addWidget(dir_group)
-
-        # Reset button — destructive-ish, kept visually secondary
-        reset_btn = QPushButton("Reset to Defaults")
-        reset_btn.setObjectName("secondary_btn")
-        reset_btn.clicked.connect(self.reset_settings)
-        reset_row = QHBoxLayout()
-        reset_row.addWidget(reset_btn)
-        reset_row.addStretch()
-        layout.addLayout(reset_row)
-
-        layout.addStretch()
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(outer_widget)
-        return scroll
+        dir_row.addWidget(dir_btn)
+        form.addLayout(dir_row, 4, 1)
+        form.setRowStretch(5, 1)
+        return widget
 
     def create_info_tab(self) -> QWidget:
-        """Create device info tab."""
-        outer_widget = QWidget()
-        outer_h = QHBoxLayout(outer_widget)
+        """Processing device and model details."""
         widget = QWidget()
-        widget.setMaximumWidth(680)
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 12, 8, 8)
-        outer_h.addWidget(widget)
-        outer_h.addStretch()
-
-        info_group = QGroupBox("System Information")
-        info_layout = QVBoxLayout(info_group)
-
-        self.info_text = QLabel()
+        lay = QVBoxLayout(widget)
+        lay.setContentsMargins(16, 16, 16, 16)
+        self.info_text = QLabel("Model not loaded yet.")
         self.info_text.setWordWrap(True)
         self.info_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        info_layout.addWidget(self.info_text)
-
-        layout.addWidget(info_group)
-        layout.addStretch()
-
-        self.update_info()
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(outer_widget)
-        return scroll
+        lay.addWidget(self.info_text)
+        lay.addStretch()
+        return widget
 
     def browse_audio_file(self):
         """Browse for audio file."""
@@ -1547,7 +1622,7 @@ class TrachSplitterGUI(QMainWindow):
         if not files:
             return
         out_root = QFileDialog.getExistingDirectory(
-            self, f"Save stems for {len(files)} tracks to…", self.working_directory
+            self, f"Save stems for {len(files)} tracks to…", self._ensure_working_dir()
         )
         if not out_root:
             return
@@ -1580,12 +1655,7 @@ class TrachSplitterGUI(QMainWindow):
         self.progress_label.setText(summary)
         self.statusBar().showMessage(summary)
         if not cancelled and ok:
-            reply = QMessageBox.question(
-                self, "Batch complete", f"{summary}.\n\nOpen the output folder?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._open_path(self._batch_out_root)
+            self.notify(summary + ".", self._batch_out_root, timeout_ms=30000)
 
     @staticmethod
     def _open_path(path: str):
@@ -1604,7 +1674,7 @@ class TrachSplitterGUI(QMainWindow):
         base = Path(self.current_audio_path).stem if getattr(self, 'current_audio_path', None) else "track"
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Click Track",
-            os.path.join(self.working_directory, f"{_safe_filename(base)}_click_{info['bpm']:.0f}bpm.wav"),
+            os.path.join(self._ensure_working_dir(), f"{_safe_filename(base)}_click_{info['bpm']:.0f}bpm.wav"),
             EXPORT_FILTERS['wav']
         )
         if not file_path:
@@ -1618,7 +1688,7 @@ class TrachSplitterGUI(QMainWindow):
             sf.write(file_path, click.T, an.sample_rate)
             return file_path
 
-        self._run_task(job, lambda p: self.statusBar().showMessage(f"Click track saved: {p}"))
+        self._run_task(job, lambda p: self.notify(f"Click track saved: {os.path.basename(p)}", p))
 
     def analyze_track(self):
         """Run BPM/key/loudness analysis on the loaded file in a worker thread."""
@@ -1636,21 +1706,21 @@ class TrachSplitterGUI(QMainWindow):
         self.analyze_btn.setEnabled(True)
         self._analysis_result = result
         self.click_btn.setEnabled(True)
-        lufs = f"{result['lufs']} LUFS  ·  " if result.get('lufs') is not None else ""
+        lufs = f"  ·  {result['lufs']} LUFS" if result.get('lufs') is not None else ""
+        mins, secs = divmod(int(round(result['duration_sec'])), 60)
         self.analysis_label.setText(
-            f"<b>{result['bpm']} BPM</b>  ·  "
-            f"<b>{result['key']} {result['mode']}</b>  ·  "
-            f"{result['duration_sec']} s<br>"
-            f"{lufs}Peak {result['peak_db']} dB  ·  RMS {result['rms_db']} dB  ·  "
+            f"{result['bpm']:.0f} BPM  ·  {result['key']} {result['mode']}  ·  "
+            f"{mins}:{secs:02d}{lufs}"
+        )
+        self.analysis_label.setToolTip(
+            f"Peak {result['peak_db']} dBFS · RMS {result['rms_db']} dB · "
             f"key confidence {result['key_confidence']:.2f}"
         )
-        self._restyle_label(self.analysis_label, "analysis_result")
         self.statusBar().showMessage("Analysis complete")
 
     def _on_analysis_error(self, error: str):
         self.analyze_btn.setEnabled(True)
-        self._restyle_label(self.analysis_label, "hint")
-        self.analysis_label.setText(f"Analysis failed: {error}")
+        self.analysis_label.setText(f"Couldn't analyze this file: {error}")
 
     def _restyle_label(self, label: QLabel, object_name: str):
         """Swap a label's style class and force Qt to re-apply the stylesheet."""
@@ -1660,14 +1730,17 @@ class TrachSplitterGUI(QMainWindow):
 
     def load_audio_file(self, file_path: str):
         """Set the current input file and remember it in recents."""
-        self.file_path_label.setText(f"♪  {os.path.basename(file_path)}")
+        self.file_path_label.setText(Path(file_path).stem)
         self.file_path_label.setToolTip(file_path)
-        self._restyle_label(self.file_path_label, "file_loaded")
+        self.source_stack.setCurrentIndex(1)
         self.current_audio_path = file_path
         self._analysis_result = None
         self.click_btn.setEnabled(False)
-        self._restyle_label(self.analysis_label, "hint")
-        self.analysis_label.setText("BPM, key and loudness of the loaded file.")
+        self.analysis_label.setToolTip("")
+        self.analysis_label.setText(
+            f"{Path(file_path).suffix.lstrip('.').upper()} · {os.path.dirname(file_path)}"
+        )
+        self.show_page(self.PAGE_SEPARATE)
         self._add_recent_file(file_path)
         self.statusBar().showMessage(f"Loaded: {os.path.basename(file_path)}")
 
@@ -1680,25 +1753,54 @@ class TrachSplitterGUI(QMainWindow):
         self._refresh_recent_combo()
 
     def _refresh_recent_combo(self):
-        self.recent_combo.blockSignals(True)
-        self.recent_combo.clear()
-        self.recent_combo.addItem("Recent files…", userData=None)
+        """Refresh the sidebar's recent list and File › Open Recent."""
+        self.recent_list.clear()
         for path in self.recent_files:
-            self.recent_combo.addItem(os.path.basename(path), userData=path)
-            self.recent_combo.setItemData(
-                self.recent_combo.count() - 1, path, Qt.ItemDataRole.ToolTipRole
-            )
-        self.recent_combo.blockSignals(False)
+            item = QListWidgetItem(Path(path).stem)
+            item.setToolTip(path)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.recent_list.addItem(item)
+        if not self.recent_files:
+            item = QListWidgetItem("No recent files")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.recent_list.addItem(item)
+        self._refresh_recent_menu()
 
-    def on_recent_selected(self, index: int):
-        path = self.recent_combo.itemData(index)
-        if not path:
+    def _refresh_recent_menu(self):
+        menu = getattr(self, 'recent_menu', None)
+        if menu is None:
+            return
+        menu.clear()
+        for path in self.recent_files:
+            a = menu.addAction(Path(path).name)
+            a.setStatusTip(path)
+            a.triggered.connect(lambda checked=False, p=path: self.on_recent_selected(p))
+        if self.recent_files:
+            menu.addSeparator()
+            menu.addAction("Clear Menu").triggered.connect(self._clear_recent)
+        else:
+            menu.addAction("No recent files").setEnabled(False)
+
+    def _clear_recent(self):
+        self.recent_files = []
+        self.config.set('recent_files', [])
+        self.config.save()
+        self._refresh_recent_combo()
+
+    def _on_recent_item(self, item: QListWidgetItem):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path:
+            self.on_recent_selected(path)
+
+    def on_recent_selected(self, path):
+        if not path or not isinstance(path, str):
             return
         if not os.path.exists(path):
-            QMessageBox.warning(self, "Missing", f"File no longer exists:\n{path}")
             self.recent_files = [p for p in self.recent_files if p != path]
             self.config.set('recent_files', self.recent_files)
+            self.config.save()
             self._refresh_recent_combo()
+            self.notify(f"“{Path(path).name}” was moved or deleted, so it was removed from Recent.")
             return
         self.load_audio_file(path)
 
@@ -1817,22 +1919,23 @@ class TrachSplitterGUI(QMainWindow):
 
         for stem, checkbox in self.stem_checkboxes.items():
             enabled = stem in available
+            if enabled and not checkbox.isEnabled():
+                checkbox.setChecked(True)  # newly offered by this model
             checkbox.setEnabled(enabled)
             checkbox.setVisible(enabled)
             if not enabled:
                 checkbox.setChecked(False)
 
         self.two_stems_combo.blockSignals(True)
-        current = self.two_stems_combo.currentText()
+        current = self.two_stems_combo.currentData()
         self.two_stems_combo.clear()
-        self.two_stems_combo.addItem("Disabled")
-        for stem in [s for s in ['drums', 'bass', 'vocals', 'other', 'guitar', 'piano'] if s in available]:
-            self.two_stems_combo.addItem(stem)
-        if current in [self.two_stems_combo.itemText(i) for i in range(self.two_stems_combo.count())]:
-            self.two_stems_combo.setCurrentText(current)
-        else:
-            self.two_stems_combo.setCurrentText("Disabled")
+        self.two_stems_combo.addItem("All stems", userData=None)
+        for stem in [s for s in ALL_STEMS if s in available]:
+            self.two_stems_combo.addItem(f"{stem.capitalize()} + everything else", userData=stem)
+        idx = self.two_stems_combo.findData(current) if current else 0
+        self.two_stems_combo.setCurrentIndex(max(0, idx))
         self.two_stems_combo.blockSignals(False)
+        self._on_output_mode_changed()
 
     def _separation_choice(self):
         """(two_stems, stem_sources) from the current UI selection."""
@@ -1840,9 +1943,7 @@ class TrachSplitterGUI(QMainWindow):
             stem for stem, checkbox in self.stem_checkboxes.items()
             if checkbox.isChecked() and checkbox.isEnabled()
         ]
-        two_stems = self.two_stems_combo.currentText()
-        if two_stems == "Disabled":
-            two_stems = None
+        two_stems = self.two_stems_combo.currentData()
         stem_sources = None if two_stems else (selected_stems or None)
         return two_stems, stem_sources
 
@@ -1924,13 +2025,15 @@ class TrachSplitterGUI(QMainWindow):
     def on_separation_finished(self, stems: Dict[str, np.ndarray]):
         """Handle separation completion."""
         self.stems = stems
-        took = time.monotonic() - getattr(self, '_sep_started', time.monotonic())
-        self.progress_label.setText(f"Completed! Extracted {len(stems)} stems in {took:.0f}s")
+        took = max(0.0, time.monotonic() - getattr(self, '_sep_started', time.monotonic()))
+        self.progress_label.setText(f"Done: {len(stems)} stems in {took:.0f} s")
         self.progress_bar.setValue(100)
         self._set_separating(False)
         self.statusBar().showMessage("Separation complete")
         self.populate_stem_outputs()
         self.rebuild_mixer(list(stems.keys()))
+        track = Path(getattr(self, '_separated_from', '') or '').stem
+        self.mix_subtitle.setText(f"{track} · {len(stems)} stems")
         self.sync_stem_controls()
         if self.auto_save_check.isChecked():
             self._auto_save_stems()
@@ -1938,7 +2041,7 @@ class TrachSplitterGUI(QMainWindow):
     def _auto_save_stems(self):
         """Write stems to <working dir>/<track>/ without asking."""
         track = Path(getattr(self, '_separated_from', 'track')).stem
-        out_dir = os.path.join(self.working_directory, _safe_filename(track))
+        out_dir = os.path.join(self._ensure_working_dir(), _safe_filename(track))
         fmt = self._output_format()
         bitrate = f"{self.bitrate_spin.value()}k"
         float32 = fmt == 'wav' and self.float32_check.isChecked()
@@ -1953,7 +2056,7 @@ class TrachSplitterGUI(QMainWindow):
                 )
             return out_dir
 
-        self._run_task(job, lambda d: self.statusBar().showMessage(f"Stems auto-saved to {d}"))
+        self._run_task(job, lambda d: self.notify(f"Stems saved to {os.path.basename(d)}", d))
 
     def on_separation_cancelled(self):
         self._set_separating(False)
@@ -2009,7 +2112,7 @@ class TrachSplitterGUI(QMainWindow):
         output_dir = QFileDialog.getExistingDirectory(
             self,
             "Select Output Directory",
-            self.working_directory
+            self._ensure_working_dir()
         )
 
         if not output_dir:
@@ -2030,7 +2133,7 @@ class TrachSplitterGUI(QMainWindow):
 
         def on_done(where):
             self._set_rendering(False)
-            QMessageBox.information(self, "Success", f"Stems saved to {where}")
+            self.notify(f"Saved {len(stems)} stems to {os.path.basename(where) or where}", where)
 
         def on_error(msg):
             self._set_rendering(False)
@@ -2059,8 +2162,15 @@ class TrachSplitterGUI(QMainWindow):
         self.preview_temp_dir = tempfile.mkdtemp(prefix="trachsplitter_stems_")
 
         # List appears immediately; preview WAVs are written off-thread
-        for stem_name in self.stems:
-            self.stem_output_list.addItem(stem_name)
+        order = {s: i for i, s in enumerate(ALL_STEMS)}
+        for stem_name in sorted(self.stems, key=lambda s: (order.get(s.replace('no_', ''), 99), s)):
+            item = QListWidgetItem(
+                ui_theme.dot_icon(ui_theme.stem_color(stem_name, self.dark)),
+                ui_theme.stem_label(stem_name),
+            )
+            item.setData(Qt.ItemDataRole.UserRole, stem_name)
+            self.stem_output_list.addItem(item)
+        self.stems_empty_label.setVisible(not self.stems)
 
         stems_snapshot = dict(self.stems)
         temp_dir = self.preview_temp_dir
@@ -2092,7 +2202,7 @@ class TrachSplitterGUI(QMainWindow):
         """Names of stems currently selected in the output list."""
         names = []
         for item in self.stem_output_list.selectedItems():
-            name = item.text().split("  (", 1)[0].strip()
+            name = item.data(Qt.ItemDataRole.UserRole)
             if name in self.stems:
                 names.append(name)
         return names
@@ -2119,7 +2229,10 @@ class TrachSplitterGUI(QMainWindow):
             return
         tag = self._stem_tag(names)
         self.current_preview_stem = tag
-        title = " + ".join(n.capitalize() for n in sorted(names))
+        title = " + ".join(ui_theme.stem_label(n) for n in sorted(names))
+        # One stem: its identity colour; a combination: neutral accent
+        color = (ui_theme.stem_color(names[0], self.dark) if len(names) == 1
+                 else ui_theme.tokens(self.dark)['accent'])
         self.statusBar().showMessage(f"Rendering {title} view…")
 
         def compute():
@@ -2131,7 +2244,7 @@ class TrachSplitterGUI(QMainWindow):
             if rtag != self.current_preview_stem:
                 return  # selection changed while computing
             self.spectrogram_view.set_audio_precomputed(
-                duration, 44100, f"{title} spectrogram", spec_data, wave_env
+                duration, 44100, title, spec_data, wave_env, color
             )
             self.statusBar().showMessage("Ready")
 
@@ -2262,14 +2375,21 @@ class TrachSplitterGUI(QMainWindow):
         self.stem_solos.clear()
         self.stem_pans.clear()
 
+        self.mixer_dots = {}
         order = {s: i for i, s in enumerate(ALL_STEMS)}
         names = sorted(stem_names, key=lambda s: (order.get(s.replace('no_', ''), 99), s))
         for stem in names:
             row_w = QWidget()
             row = QHBoxLayout(row_w)
-            row.setContentsMargins(0, 0, 0, 0)
+            row.setContentsMargins(0, 2, 0, 2)
+            row.setSpacing(8)
 
-            label = "Everything but " + stem[3:] if stem.startswith('no_') else stem.capitalize()
+            label = ui_theme.stem_label(stem)
+            dot = QLabel()
+            dot.setFixedWidth(12)
+            dot.setPixmap(ui_theme.dot_icon(ui_theme.stem_color(stem, self.dark)).pixmap(12, 12))
+            self.mixer_dots[stem] = dot
+            row.addWidget(dot)
             name_lbl = QLabel(label)
             name_lbl.setMinimumWidth(60)
             row.addWidget(name_lbl, 2)
@@ -2278,7 +2398,8 @@ class TrachSplitterGUI(QMainWindow):
             mute_btn.setObjectName("mute_btn")
             mute_btn.setCheckable(True)
             mute_btn.setFixedSize(28, 28)
-            mute_btn.setToolTip("Mute")
+            mute_btn.setToolTip(f"Mute {label}")
+            mute_btn.setAccessibleName(f"Mute {label}")
             self.stem_mutes[stem] = mute_btn
             row.addWidget(mute_btn)
 
@@ -2286,7 +2407,8 @@ class TrachSplitterGUI(QMainWindow):
             solo_btn.setObjectName("solo_btn")
             solo_btn.setCheckable(True)
             solo_btn.setFixedSize(28, 28)
-            solo_btn.setToolTip("Solo — silence all other stems")
+            solo_btn.setToolTip(f"Solo {label}: silence every other stem")
+            solo_btn.setAccessibleName(f"Solo {label}")
             self.stem_solos[stem] = solo_btn
             solo_btn.clicked.connect(lambda checked, s=stem: self._handle_solo(s, checked))
             row.addWidget(solo_btn)
@@ -2295,26 +2417,28 @@ class TrachSplitterGUI(QMainWindow):
             slider.setMinimum(-60)
             slider.setMaximum(12)
             slider.setValue(0)
-            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-            slider.setTickInterval(6)
             slider.setToolTip("Volume in dB")
+            slider.setAccessibleName(f"{label} volume")
             self.stem_sliders[stem] = slider
             row.addWidget(slider, 5)
 
-            db_lbl = QLabel("+0 dB")
-            db_lbl.setMinimumWidth(52)
+            db_lbl = QLabel("0 dB")
+            db_lbl.setObjectName("secondary")
+            db_lbl.setFixedWidth(52)
+            db_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.stem_labels[stem] = db_lbl
             slider.valueChanged.connect(
                 lambda val, s=stem, lbl=db_lbl: self.update_slider_label(s, val, lbl)
             )
-            row.addWidget(db_lbl, 1)
+            row.addWidget(db_lbl)
 
             pan_slider = QSlider(Qt.Orientation.Horizontal)
+            pan_slider.setObjectName("pan")
             pan_slider.setMinimum(-100)
             pan_slider.setMaximum(100)
             pan_slider.setValue(0)
             pan_slider.setToolTip("Pan: left ↔ right (presets reset to center)")
-            pan_slider.setMaximumWidth(120)
+            pan_slider.setAccessibleName(f"{label} pan")
             self.stem_pans[stem] = pan_slider
             row.addWidget(pan_slider, 2)
 
@@ -2358,7 +2482,7 @@ class TrachSplitterGUI(QMainWindow):
         fmt = self._output_format()
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Mix As",
-            os.path.join(self.working_directory, f"{_safe_filename(track)}_{safe_name}.{fmt}"),
+            os.path.join(self._ensure_working_dir(), f"{_safe_filename(track)}_{safe_name}.{fmt}"),
             ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
@@ -2375,7 +2499,7 @@ class TrachSplitterGUI(QMainWindow):
         def on_done(written):
             self._set_rendering(False)
             self.statusBar().showMessage(f"Saved: {os.path.basename(written)}")
-            QMessageBox.information(self, "Saved", f"Mix saved:\n{written}")
+            self.notify(f"Mix saved: {os.path.basename(written)}", written)
 
         def on_error(msg):
             self._set_rendering(False)
@@ -2397,7 +2521,7 @@ class TrachSplitterGUI(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Merged Stems As",
-            os.path.join(self.working_directory, default_name),
+            os.path.join(self._ensure_working_dir(), default_name),
             ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
@@ -2413,7 +2537,7 @@ class TrachSplitterGUI(QMainWindow):
         def on_done(written):
             self._set_rendering(False)
             self.statusBar().showMessage(f"Merged mix saved: {os.path.basename(written)}")
-            QMessageBox.information(self, "Saved", f"Merged {len(names)} stems:\n{written}")
+            self.notify(f"Merged {len(names)} stems: {os.path.basename(written)}", written)
 
         def on_error(msg):
             self._set_rendering(False)
@@ -2423,7 +2547,7 @@ class TrachSplitterGUI(QMainWindow):
 
     def update_slider_label(self, stem: str, value: int, label: QLabel):
         """Update slider value label."""
-        label.setText(f"{value:+d} dB")
+        label.setText(f"{value:+d} dB" if value else "0 dB")
 
     def _collect_render_params(self) -> Dict:
         """Snapshot all mixer/effect widget state (UI thread only)."""
@@ -2575,7 +2699,7 @@ class TrachSplitterGUI(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Mix As",
-            os.path.join(self.working_directory, f"{_safe_filename(track)}_mix.{fmt}"),
+            os.path.join(self._ensure_working_dir(), f"{_safe_filename(track)}_mix.{fmt}"),
             ";;".join(EXPORT_FILTERS.values()),
             EXPORT_FILTERS.get(fmt, EXPORT_FILTERS['wav'])
         )
@@ -2598,7 +2722,7 @@ class TrachSplitterGUI(QMainWindow):
         def on_done(written):
             self._set_rendering(False)
             self.statusBar().showMessage(f"Mix saved: {os.path.basename(written)}")
-            QMessageBox.information(self, "Saved", f"Mix saved:\n{written}")
+            self.notify(f"Mix saved: {os.path.basename(written)}", written)
 
         def on_error(msg):
             self._set_rendering(False)
@@ -2634,7 +2758,7 @@ class TrachSplitterGUI(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Selection As",
-            os.path.join(self.working_directory, default_name),
+            os.path.join(self._ensure_working_dir(), default_name),
             ";;".join(EXPORT_FILTERS.values()), EXPORT_FILTERS.get(fmt)
         )
         if not file_path:
@@ -2652,7 +2776,7 @@ class TrachSplitterGUI(QMainWindow):
         def on_done(written):
             self._set_rendering(False)
             self.statusBar().showMessage(f"Selection saved: {os.path.basename(written)}")
-            QMessageBox.information(self, "Saved", f"Selection saved:\n{written}")
+            self.notify(f"Selection saved: {os.path.basename(written)}", written)
 
         def on_error(msg):
             self._set_rendering(False)
@@ -2665,12 +2789,33 @@ class TrachSplitterGUI(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(
             self,
             "Select Working Directory",
-            self.working_directory
+            self._ensure_working_dir()
         )
         if dir_path:
             self.working_directory = dir_path
             self.dir_label.setText(dir_path)
             self._save_setting('working_directory', dir_path)
+
+    def _ensure_working_dir(self) -> str:
+        """Working folder that is guaranteed to exist.
+
+        Windows' Save dialog shows "File not found" when the suggested path
+        points into a folder that doesn't exist (the default
+        Music/TrachSplitter is never created otherwise).
+        """
+        for candidate in (self.working_directory,
+                          str(Path.home() / "Music" / "TrachSplitter"),
+                          str(Path.home())):
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                if candidate != self.working_directory:
+                    self.working_directory = candidate
+                    if hasattr(self, 'dir_label'):
+                        self.dir_label.setText(candidate)
+                return candidate
+            except OSError:
+                continue
+        return str(Path.home())
 
     def _save_setting(self, key: str, value):
         """Persist a single setting immediately."""
@@ -2714,17 +2859,16 @@ class TrachSplitterGUI(QMainWindow):
                 (group for group, ids in self.config.MODEL_GROUPS.items() if info['model'] in ids),
                 'Other'
             )
-            info_text = f"""
-            <b>Device:</b> {info['device'].upper()}<br>
-            <b>CUDA Available:</b> {info['cuda_available']}<br>
-            <b>GPU:</b> {info['cuda_device']}<br>
-            <b>Model:</b> {info['model']}<br>
-            <b>Tier:</b> {group_name}<br>
-            <b>Model Notes:</b> {note}<br>
-            <b>Recommendation:</b> {rec}<br>
-            <b>Supported Stems:</b> {', '.join(available)}<br>
-            <b>Sources:</b> {info['sources']}<br>
-            """
+            rows = [
+                ("Processor", info['device'].upper()),
+                ("GPU", info['cuda_device']),
+                ("Model", f"{info['model']} ({group_name})"),
+                ("About this model", note),
+                ("Stems", ", ".join(s.capitalize() for s in available)),
+            ]
+            info_text = "<table cellspacing='6'>" + "".join(
+                f"<tr><td style='color:gray'>{k}</td><td>{v}</td></tr>" for k, v in rows
+            ) + "</table>"
             self.info_text.setText(info_text)
 
     def closeEvent(self, event):
@@ -2770,6 +2914,11 @@ def main():
 
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
+    app.setApplicationName("TrachSplitter")
+    # Fusion renders stylesheets identically on every OS; colours come from
+    # ui_theme and follow the system light/dark appearance
+    app.setStyle(QStyleFactory.create("Fusion"))
+    app.setFont(ui_theme.ui_font())
     if sys.platform == "win32":
         # Give the process its own taskbar identity so the icon shows
         import ctypes

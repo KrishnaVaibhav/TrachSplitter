@@ -68,7 +68,7 @@ HIDDEN_IMPORTS = [
     "matplotlib.backends.backend_qtagg",
     "matplotlib.backends.backend_agg",
     # Project modules (some are imported lazily inside functions)
-    "config", "demucs_separator", "audio_editor", "audio_analysis",
+    "config", "demucs_separator", "audio_editor", "audio_analysis", "ui_theme",
     "scipy.ndimage",
     # Other runtime dependencies
     "yaml", "tqdm", "einops", "dora", "treetable",
@@ -89,6 +89,25 @@ def run(cmd: list[str], **kwargs):
     subprocess.run(cmd, check=True, **kwargs)
 
 
+def ensure_app_not_running():
+    """A running copy locks dist/ files; PyInstaller then fails after minutes
+    of work with 'Access is denied'. Check up front instead."""
+    if SYSTEM != "Windows":
+        return
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {APP_NAME}.exe", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return
+    if f"{APP_NAME}.exe".lower() in out.lower():
+        sys.exit(
+            f"ERROR: {APP_NAME}.exe is running and locks the files in dist/.\n"
+            f"       Close the app (or run: taskkill /IM {APP_NAME}.exe /F) and build again."
+        )
+
+
 def ensure_pyinstaller():
     try:
         import PyInstaller  # noqa: F401
@@ -103,7 +122,7 @@ def collect_datas() -> list[tuple[str, str]]:
 
     # Local project modules that PyInstaller may miss
     for name in ["config.py", "demucs_separator.py", "audio_editor.py",
-                 "audio_analysis.py", "icon.ico", "icon.svg"]:
+                 "audio_analysis.py", "ui_theme.py", "icon.ico", "icon.svg"]:
         src = ROOT / name
         if src.exists():
             datas.append((str(src), "."))
@@ -142,7 +161,9 @@ def convert_icon():
         import cairosvg
         from PIL import Image
         import io
-    except ImportError:
+    except (ImportError, OSError):
+        # OSError: cairosvg is installed but the native cairo DLL is missing
+        # (common on Windows) — keep the existing icon.ico instead
         print("[icon] cairosvg or Pillow not installed — skipping icon conversion.")
         print("       Run:  pip install cairosvg   to enable icon embedding.")
         return
@@ -356,6 +377,8 @@ def main():
 
     if not ENTRY.exists():
         sys.exit(f"ERROR: Entry point not found: {ENTRY}")
+
+    ensure_app_not_running()
 
     if args.clean:
         for d in (BUILD_DIR, DIST):
