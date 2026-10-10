@@ -44,6 +44,24 @@ def _shelf_sos(freq: float, gain_db: float, fs: int, high: bool, q: float = 0.70
     return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]])
 
 
+def write_audio_file(path: str, audio: np.ndarray, sample_rate: int,
+                     block: int = 65536, **kwargs):
+    """Write (channels, samples) audio with soundfile in blocks.
+
+    One big sf.write of a full song as OGG overflows libsndfile's stack
+    in the Vorbis encoder and kills the whole process; block writes avoid it
+    (and keep memory flat for every format).
+    """
+    import soundfile as sf
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim == 1:
+        audio = audio.reshape(1, -1)
+    with sf.SoundFile(path, 'w', samplerate=sample_rate,
+                      channels=audio.shape[0], **kwargs) as f:
+        for start in range(0, audio.shape[1], block):
+            f.write(np.ascontiguousarray(audio[:, start:start + block].T))
+
+
 class AudioEditor:
     """Audio editing and mixing utilities."""
 
@@ -502,7 +520,6 @@ class AudioEditor:
             Path of the written file
         """
         import os
-        import soundfile as sf
 
         audio = self._as_2d(audio)
         # Hard clip: integer formats wrap around on overs, which sounds awful
@@ -519,7 +536,7 @@ class AudioEditor:
             os.makedirs(out_dir, exist_ok=True)
 
         if audio_format in ('wav', 'flac', 'ogg'):
-            sf.write(output_path, audio.T, self.sample_rate)
+            write_audio_file(output_path, audio, self.sample_rate)
             return output_path
 
         if audio_format == 'mp3':
@@ -528,11 +545,11 @@ class AudioEditor:
                 # its 0..1 compression level (0 = highest quality)
                 kbps = int(str(bitrate).rstrip('kK') or 192)
                 level = float(np.clip((320 - kbps) / 256.0, 0.0, 1.0))
-                sf.write(output_path, audio.T, self.sample_rate,
-                         format='MP3', compression_level=level)
+                write_audio_file(output_path, audio, self.sample_rate,
+                                 format='MP3', compression_level=level)
                 return output_path
-            except Exception:
-                logger.info("soundfile MP3 write failed, falling back to pydub/ffmpeg")
+            except Exception as e:
+                logger.info(f"soundfile MP3 write failed ({e}), falling back to pydub/ffmpeg")
             from pydub import AudioSegment
             pcm = (audio.T * 32767).astype(np.int16)
             segment = AudioSegment(

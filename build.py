@@ -238,6 +238,11 @@ def build_pyinstaller(onefile: bool):
 
     run(cmd, cwd=ROOT)
 
+    # build/ holds an intermediate exe that can't run on its own ("Failed to
+    # load Python DLL"); delete it so only the dist/ copy can be launched
+    for stray in (BUILD_DIR / APP_NAME).glob("*.exe"):
+        stray.unlink(missing_ok=True)
+
 
 def _write_win_version_file() -> str:
     """Write a Windows version-info file and return its path."""
