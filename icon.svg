@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="35%" cy="30%" r="90%">
+      <stop offset="0%" stop-color="#122438"/>
+      <stop offset="60%" stop-color="#0a1522"/>
+      <stop offset="100%" stop-color="#060d16"/>
+    </radialGradient>
+    <linearGradient id="inwave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e8fbff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#7bdff2"/>
+    </linearGradient>
+    <linearGradient id="prism" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7bdff2" stop-opacity="0.35"/>
+      <stop offset="50%" stop-color="#14919b" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#0d7377" stop-opacity="0.30"/>
+    </linearGradient>
+    <linearGradient id="prismEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#bdf3ff"/>
+      <stop offset="100%" stop-color="#0d7377"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="10" y="10" width="492" height="492" rx="102" fill="none"
+        stroke="#7bdff2" stroke-opacity="0.12" stroke-width="3"/>
+
+  <!-- Incoming mixed waveform (left) -->
+  <path d="M 40 256
+           L 62 256 L 70 236 L 80 276 L 90 216 L 100 296 L 110 196
+           L 120 316 L 130 226 L 140 276 L 150 246 L 160 262 L 172 256 L 196 256"
+        fill="none" stroke="url(#inwave)" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+
+  <!-- Prism (center) -->
+  <path d="M 256 128 L 336 328 L 176 328 Z"
+        fill="url(#prism)" stroke="url(#prismEdge)" stroke-width="7"
+        stroke-linejoin="round"/>
+  <!-- prism inner facet highlight -->
+  <path d="M 256 148 L 256 318" stroke="#bdf3ff" stroke-opacity="0.35"
+        stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Four separated stem beams (right), each its own color and wave character -->
+  <!-- vocals : coral, smooth melodic wave -->
+  <path d="M 316 236 C 356 216, 380 176, 408 160 C 424 151, 442 146, 462 144"
+        fill="none" stroke="#ff5e7e" stroke-width="11" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="466" cy="143" r="12" fill="#ff5e7e"/>
+
+  <!-- drums : amber, punchy notched line -->
+  <path d="M 324 260 L 366 254 L 376 234 L 390 250 L 404 226 L 418 244 L 462 226"
+        fill="none" stroke="#ffd166" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <circle cx="466" cy="225" r="12" fill="#ffd166"/>
+
+  <!-- bass : green, slow deep wave -->
+  <path d="M 324 286 C 360 300, 384 276, 412 292 C 430 302, 446 300, 462 304"
+        fill="none" stroke="#06d6a0" stroke-width="11" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="466" cy="305" r="12" fill="#06d6a0"/>
+
+  <!-- other : cyan, gentle ripple falling away -->
+  <path d="M 312 310 C 348 340, 376 356, 406 372 C 424 381, 442 384, 458 386"
+        fill="none" stroke="#7bdff2" stroke-width="11" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="462" cy="387" r="12" fill="#7bdff2"/>
+
+  <!-- Sparkle where the wave meets the prism -->
+  <g stroke="#e8fbff" stroke-width="4" stroke-linecap="round" opacity="0.85">
+    <path d="M 205 244 L 205 228"/>
+    <path d="M 196 252 L 182 244"/>
+    <path d="M 199 268 L 186 276"/>
+  </g>
+</svg>
