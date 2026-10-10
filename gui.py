@@ -2854,7 +2854,6 @@ class TrachSplitterGUI(QMainWindow):
             info = self.separator.get_device_info()
             available = self.config.MODEL_SOURCES.get(info['model'], [])
             note = self.config.MODEL_NOTES.get(info['model'], 'Unknown capabilities')
-            rec = self.config.MODEL_RECOMMENDATIONS.get(info['model'], '')
             group_name = next(
                 (group for group, ids in self.config.MODEL_GROUPS.items() if info['model'] in ids),
                 'Other'
