@@ -333,14 +333,14 @@ class DemucsSeparator:
             if others:
                 pair[f'no_{two_stems}'] = np.sum(others, axis=0)
             stems = pair
+        # soundfile, not torchaudio.save: newer torchaudio releases moved
+        # saving to an optional backend
+        from audio_editor import write_audio_file
         for stem_name, stem_data in stems.items():
-            tensor = torch.from_numpy(np.ascontiguousarray(stem_data)).float()
-            if tensor.ndim == 1:
-                tensor = tensor.unsqueeze(0)
-            torchaudio.save(
+            write_audio_file(
                 os.path.join(output_dir, f'{stem_name}.wav'),
-                tensor.clamp(-1.0, 1.0),
-                SAMPLE_RATE
+                np.clip(np.atleast_2d(stem_data), -1.0, 1.0),
+                SAMPLE_RATE,
             )
         logger.info(f"Stems saved to {output_dir}")
 

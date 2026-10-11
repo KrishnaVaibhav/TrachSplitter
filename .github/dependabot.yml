@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+    groups:
+      audio-ml:
+        patterns: ["torch", "torchaudio", "demucs", "librosa", "numpy", "scipy", "soundfile"]
+    ignore:
+      # Major PyTorch/Qt upgrades need manual testing of separation + packaging
+      - dependency-name: "torch"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "PySide6"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci

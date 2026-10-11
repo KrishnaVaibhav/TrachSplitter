@@ -1,6 +1,6 @@
 """Audio analysis utilities: tempo, key, loudness, click tracks."""
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 import logging
 
 

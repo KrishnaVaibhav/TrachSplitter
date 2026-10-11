@@ -1,0 +1,7 @@
+# Every change needs approval from a code owner (enforced by branch protection).
+*                       @KrishnaVaibhav
+
+# Release-critical paths
+/.github/               @KrishnaVaibhav
+/build.py               @KrishnaVaibhav
+/requirements*.txt      @KrishnaVaibhav

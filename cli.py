@@ -222,6 +222,13 @@ def batch_command(args):
 
 def main():
     """Main CLI entry point."""
+    # Status lines use emoji; legacy Windows code pages (cp1252) can't encode
+    # them and print() would raise mid-run
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(
         description='TrachSplitter - Audio Source Separation & Editing'
     )

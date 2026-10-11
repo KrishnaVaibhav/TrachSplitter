@@ -22,7 +22,6 @@ Notes:
 """
 
 import argparse
-import os
 import platform
 import shutil
 import subprocess
@@ -127,14 +126,6 @@ def collect_datas() -> list[tuple[str, str]]:
         if src.exists():
             datas.append((str(src), "."))
 
-    # soundfile binary data (libsndfile)
-    try:
-        import soundfile as sf
-        sf_data = Path(sf.__file__).parent / "_sndfile.cpython*"
-        # soundfile includes its library; PyInstaller usually finds it but be explicit
-    except ImportError:
-        pass
-
     # matplotlib style data
     try:
         import matplotlib
@@ -167,8 +158,6 @@ def convert_icon():
         print("[icon] cairosvg or Pillow not installed — skipping icon conversion.")
         print("       Run:  pip install cairosvg   to enable icon embedding.")
         return
-
-    sizes = [16, 32, 48, 64, 128, 256, 512]
 
     def svg_to_pil(size: int) -> "Image.Image":
         png_bytes = cairosvg.svg2png(url=str(svg), output_width=size, output_height=size)
